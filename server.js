@@ -41,7 +41,22 @@ const CONFIG = {
     
     // Auto extraction (disabled by default, enable with env var)
     EXTRACT_INTERVAL: parseInt(process.env.EXTRACT_INTERVAL || '0'),
+    
+    // Public directory for static files
+    PUBLIC_DIR: path.join(__dirname, 'public'),
 };
+
+// ==================== Ensure directories exist ====================
+const dirs = ['batches', 'batchdetails', 'live', 'topics', 'content', 'meta'];
+dirs.forEach(dir => {
+    const fullPath = path.join(CONFIG.DATA_DIR, dir);
+    if (!fs.existsSync(fullPath)) fs.mkdirSync(fullPath, { recursive: true });
+});
+
+// Ensure public directory exists
+if (!fs.existsSync(CONFIG.PUBLIC_DIR)) {
+    fs.mkdirSync(CONFIG.PUBLIC_DIR, { recursive: true });
+}
 
 // ==================== Storage Layer ====================
 class StorageManager {
@@ -415,7 +430,6 @@ class ExtractionEngine {
 
             console.log(`Found ${batches.length} total batches in source`);
             
-            // 🔒 ONLY extract NEW batches - never re-process existing ones
             const existingIds = new Set(this.storage.getAllBatchIds());
             const newBatches = batches.filter(b => !existingIds.has(b._id));
 
@@ -430,7 +444,6 @@ class ExtractionEngine {
             console.log(`🆕 Found ${newBatches.length} NEW batches to extract`);
             this.stats.total = newBatches.length;
 
-            // Process ONLY new batches with high concurrency
             const chunks = this.chunkArray(newBatches, CONFIG.MAX_CONCURRENT);
             
             for (const chunk of chunks) {
@@ -440,7 +453,6 @@ class ExtractionEngine {
                 await new Promise(r => setTimeout(r, CONFIG.REQUEST_DELAY));
             }
 
-            // Save stats
             this.stats.lastRun = new Date().toISOString();
             this.storage.saveJSON('meta', 'extraction-stats', this.stats);
 
@@ -470,14 +482,11 @@ class ExtractionEngine {
             this.stats.currentBatch = batch.name || batch._id;
             console.log(`\n📦 Processing: ${batch.name} (${this.stats.processed + 1}/${this.stats.total})`);
 
-            // Save batch (will skip if already exists)
             this.storage.saveJSON('batches', batch._id, batch);
 
-            // Fetch live classes
             await this.fetchAllLive(batch._id);
             await new Promise(r => setTimeout(r, CONFIG.REQUEST_DELAY));
 
-            // Fetch ALL batch details (subjects)
             const details = await this.fetchBatchDetails(batch._id);
             
             if (details && details.data && details.data.subjects) {
@@ -565,7 +574,7 @@ class ExtractionEngine {
                     console.log(`      📄 ${type}: ${content.data.length} items`);
                 }
             } catch (error) {
-                // Silently continue for individual content failures
+                // Silently continue
             }
             await new Promise(r => setTimeout(r, CONFIG.REQUEST_DELAY));
         }
@@ -598,7 +607,7 @@ class Router {
     }
 
     setupRoutes() {
-        // API Routes only - NO admin routes
+        // API Routes
         this.addRoute('GET', '/api/batches', this.handleGetBatches.bind(this));
         this.addRoute('GET', '/api/batchdetails', this.handleGetBatchDetails.bind(this));
         this.addRoute('GET', '/api/live', this.handleGetLive.bind(this));
@@ -611,8 +620,9 @@ class Router {
         this.addRoute('GET', '/api/export', this.handleExport.bind(this));
         this.addRoute('GET', '/health', this.handleHealth.bind(this));
         
-        // Home route - simple JSON status
-        this.addRoute('GET', '/', this.handleHome.bind(this));
+        // Static files from /public folder
+        this.addRoute('GET', '/', this.serveAdminHTML.bind(this));
+        this.addRoute('GET', '/admin', this.serveAdminHTML.bind(this));
     }
 
     addRoute(method, path, handler) {
@@ -620,6 +630,53 @@ class Router {
             this.routes.set(method, new Map());
         }
         this.routes.get(method).set(path, handler);
+    }
+
+    // 🆕 Serve static files
+    serveFile(filePath, contentType, res) {
+        try {
+            if (!fs.existsSync(filePath)) {
+                res.writeHead(404);
+                res.end('File not found');
+                return;
+            }
+            const content = fs.readFileSync(filePath);
+            res.writeHead(200, { 'Content-Type': contentType });
+            res.end(content);
+        } catch (e) {
+            res.writeHead(500);
+            res.end('Error loading file');
+        }
+    }
+
+    // 🆕 Handle all static file requests
+    async handleStatic(req, res) {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const pathname = url.pathname;
+        
+        const mimeTypes = {
+            '.html': 'text/html',
+            '.css': 'text/css',
+            '.js': 'application/javascript',
+            '.json': 'application/json',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.svg': 'image/svg+xml',
+            '.ico': 'image/x-icon',
+        };
+        
+        const ext = path.extname(pathname);
+        const contentType = mimeTypes[ext] || 'text/plain';
+        
+        // Security: prevent directory traversal
+        const safePath = path.normalize(path.join(CONFIG.PUBLIC_DIR, pathname));
+        if (!safePath.startsWith(CONFIG.PUBLIC_DIR)) {
+            res.writeHead(403);
+            res.end('Forbidden');
+            return;
+        }
+        
+        this.serveFile(safePath, contentType, res);
     }
 
     async handleRequest(req, res) {
@@ -648,6 +705,7 @@ class Router {
             return;
         }
 
+        // Check API routes first
         const methodRoutes = this.routes.get(method);
         if (methodRoutes) {
             const handler = methodRoutes.get(pathname);
@@ -662,38 +720,73 @@ class Router {
             }
         }
 
+        // If not an API route, try to serve static file
+        if (method === 'GET') {
+            await this.handleStatic(req, res);
+            return;
+        }
+
         this.sendError(res, 404, 'Not found');
     }
 
-    async handleHome(req, res, params) {
-        const fileStats = this.storage.getStats();
-        let totalSize = 0;
-        Object.values(fileStats).forEach(stat => totalSize += stat.size);
-        
-        this.sendJSON(res, {
-            name: 'MixVibe Mirror API',
-            version: '2.0',
-            status: 'running',
-            dataProtected: true,
-            stats: {
-                batches: fileStats.batches?.count || 0,
-                content: fileStats.content?.count || 0,
-                totalSizeMB: (totalSize / (1024 * 1024)).toFixed(2)
-            },
-            endpoints: {
-                batches: '/api/batches',
-                batchDetails: '/api/batchdetails?batchId=',
-                live: '/api/live?batchId=',
-                topics: '/api/topics?batchId=&subjectId=',
-                content: '/api/content?batchId=&subjectId=&topicId=&contentType=',
-                stats: '/api/stats',
-                extract: 'POST /api/extract',
-                extractAll: 'POST /api/extract-all',
-                search: '/api/search?q=',
-                export: '/api/export',
-                health: '/health'
-            }
-        });
+    // 🆕 Serve admin.html from /public folder
+    async serveAdminHTML(req, res, params) {
+        const filePath = path.join(CONFIG.PUBLIC_DIR, 'admin.html');
+        if (!fs.existsSync(filePath)) {
+            // Fallback: show embedded admin if file doesn't exist
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(this.getFallbackAdminHTML());
+            return;
+        }
+        this.serveFile(filePath, 'text/html', res);
+    }
+
+    // Fallback admin HTML
+    getFallbackAdminHTML() {
+        return `<!DOCTYPE html>
+<html>
+<head>
+    <title>MixVibe Mirror</title>
+    <style>
+        body { font-family: system-ui; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+        button { padding: 1rem 2rem; background: #238636; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 1rem; }
+        button:hover { background: #2ea043; }
+        button:disabled { opacity: 0.5; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 2rem 0; }
+        .stat { background: #161b22; padding: 1.5rem; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 2rem; color: #58a6ff; font-weight: bold; }
+        .stat-label { color: #8b949e; margin-top: 0.5rem; }
+    </style>
+</head>
+<body>
+    <h1>🔴 MixVibe Mirror Server</h1>
+    <p>Place <code>admin.html</code>, <code>style.css</code>, and <code>script.js</code> in the <code>/public</code> folder</p>
+    <div class="stats">
+        <div class="stat"><div class="stat-value" id="batches">-</div><div class="stat-label">Batches</div></div>
+        <div class="stat"><div class="stat-value" id="content">-</div><div class="stat-label">Content</div></div>
+    </div>
+    <button onclick="extract()">Start Extraction</button>
+    <div id="status"></div>
+    <script>
+        async function loadStats() {
+            const r = await fetch('/api/stats');
+            const d = await r.json();
+            document.getElementById('batches').textContent = d.files.batches?.count || 0;
+            document.getElementById('content').textContent = d.files.content?.count || 0;
+        }
+        async function extract() {
+            document.querySelector('button').disabled = true;
+            document.getElementById('status').textContent = 'Extracting...';
+            await fetch('/api/extract', { method: 'POST' });
+            document.querySelector('button').disabled = false;
+            document.getElementById('status').textContent = 'Done!';
+            loadStats();
+        }
+        loadStats();
+        setInterval(loadStats, 3000);
+    </script>
+</body>
+</html>`;
     }
 
     async handleGetBatches(req, res, params) {
@@ -973,19 +1066,16 @@ class MixVibeMirrorServer {
     }
 
     async start() {
-        // Load existing stats
         const stats = this.storage.loadJSON('meta', 'extraction-stats');
         if (stats) {
             console.log('Loaded existing extraction stats');
             this.extraction.stats = stats;
         }
 
-        // Create server
         const server = http.createServer((req, res) => {
             this.router.handleRequest(req, res);
         });
 
-        // Start listening
         server.listen(CONFIG.PORT, CONFIG.HOST, () => {
             console.log('='.repeat(60));
             console.log('🚀 MixVibe Mirror Server - UNLIMITED EDITION');
@@ -993,26 +1083,14 @@ class MixVibeMirrorServer {
             console.log('🔒 DATA PROTECTION: Never overwrites or deletes existing data');
             console.log('💡 Only extracts NEW content not already in storage');
             console.log('='.repeat(60));
-            console.log(`Environment: ${CONFIG.NODE_ENV}`);
             console.log(`Server: http://${CONFIG.DOMAIN}:${CONFIG.PORT}`);
+            console.log(`Admin: http://${CONFIG.DOMAIN}:${CONFIG.PORT}/admin`);
             console.log(`Storage: ${CONFIG.DATA_DIR}`);
-            console.log(`Max Concurrent: ${CONFIG.MAX_CONCURRENT}`);
+            console.log(`Public: ${CONFIG.PUBLIC_DIR}`);
             console.log('='.repeat(60));
-            console.log('API Endpoints:');
-            console.log('  GET  /api/batches');
-            console.log('  GET  /api/batchdetails?batchId=');
-            console.log('  GET  /api/live?batchId=');
-            console.log('  GET  /api/topics?batchId=&subjectId=');
-            console.log('  GET  /api/content?batchId=&subjectId=&topicId=&contentType=');
-            console.log('  GET  /api/stats');
-            console.log('  GET  /api/search?q=');
-            console.log('  GET  /api/export');
-            console.log('  POST /api/extract');
-            console.log('  POST /api/extract-all');
-            console.log('  GET  /health');
+            console.log('💡 Place admin.html in /public folder for full admin panel');
             console.log('='.repeat(60));
             
-            // Auto-extraction if enabled
             if (CONFIG.EXTRACT_INTERVAL > 0) {
                 console.log(`Auto-extraction every ${CONFIG.EXTRACT_INTERVAL}ms`);
                 setInterval(() => {
@@ -1021,7 +1099,6 @@ class MixVibeMirrorServer {
             }
         });
 
-        // Graceful shutdown
         process.on('SIGTERM', () => this.shutdown(server));
         process.on('SIGINT', () => this.shutdown(server));
     }
@@ -1043,4 +1120,4 @@ class MixVibeMirrorServer {
 // ==================== Startup ====================
 const server = new MixVibeMirrorServer();
 server.start().catch(console.error);
-    
+                    
