@@ -1,7 +1,8 @@
+
 {
   "name": "mixvibe-mirror",
   "version": "1.0.0",
-  "description": "MixVibe API Mirror – xtaiirus.onrender.com",
+  "description": "MixVibe API Mirror – Data stored in GitHub repo",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "engines": { "node": ">=18.x" },
