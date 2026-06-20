@@ -1,28 +1,27 @@
+# MixVibe Mirror API Server
 
-# MixVibe Mirror API
+A zero‑dependency Node.js backend that extracts course data from MixVibe and serves it as a drop‑in replacement API.
 
-**Domain:** [xtaiirus.onrender.com](https://xtaiirus.onrender.com)
+## Live Deployment
 
-Zero-dependency Node.js mirror of MixVibe education API with persistent storage.
+The server is running at **[https://xtaiirus.onrender.com](https://xtaiirus.onrender.com)**.
 
-## Live Endpoints
+- Admin page: [https://xtaiirus.onrender.com/admin](https://xtaiirus.onrender.com/admin)
+- API: `https://xtaiirus.onrender.com/api/batches` etc.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
 | GET | `/api/batches` | All batches |
-| GET | `/api/batchdetails?batchId=` | Subjects |
+| GET | `/api/batchdetails?batchId=` | Subjects for a batch |
 | GET | `/api/live?batchId=` | Live classes |
 | GET | `/api/topics?batchId=&subjectId=` | Topics |
-| GET | `/api/content?batchId=&subjectId=&topicId=&contentType=` | Content |
-| GET | `/api/stats` | Statistics |
-| POST | `/api/extract` | Trigger extraction |
-| GET | `/api/health` | Health check |
+| GET | `/api/content?batchId=&subjectId=&topicId=&contentType=` | Videos/notes/DPP |
+| GET | `/api/stats` | Extraction progress |
+| POST | `/api/extract` | Start incremental extraction |
 
-## Quick Start
+## Running Locally
 
 ```bash
-# Trigger extraction
-curl -X POST https://xtaiirus.onrender.com/api/extract
-
-# Get data
-curl https://xtaiirus.onrender.com/api/batches
+node server.js
