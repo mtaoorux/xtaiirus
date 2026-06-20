@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MixVibe Mirror - Admin</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117; 
+            color: #c9d1d9; 
+            padding: 20px;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #58a6ff; margin-bottom: 10px; }
+        
+        .stats { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); 
+            gap: 10px; 
+            margin: 20px 0; 
+        }
+        .stat { 
+            background: #161b22; 
+            padding: 15px; 
+            border-radius: 8px; 
+            text-align: center;
+            border: 1px solid #30363d;
+        }
+        .stat .value { font-size: 28px; font-weight: bold; color: #58a6ff; }
+        .stat .label { font-size: 12px; color: #8b949e; margin-top: 5px; }
+        
+        .buttons { margin: 20px 0; display: flex; gap: 10px; flex-wrap: wrap; }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            color: white;
+        }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-extract { background: #238636; }
+        .btn-refresh { background: #1f6feb; }
+        .btn-export { background: #8957e5; }
+        button:hover { filter: brightness(1.2); }
+        
+        .status {
+            background: #161b22;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border: 1px solid #30363d;
+        }
+        .status .title { font-weight: bold; margin-bottom: 10px; }
+        
+        .progress {
+            width: 100%;
+            height: 8px;
+            background: #21262d;
+            border-radius: 4px;
+            margin: 10px 0;
+            overflow: hidden;
+        }
+        .progress .fill {
+            height: 100%;
+            background: #238636;
+            width: 0%;
+            transition: width 0.5s;
+        }
+        
+        .log {
+            background: #000;
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            max-height: 400px;
+            overflow-y: auto;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        
+        .endpoints {
+            background: #161b22;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border: 1px solid #30363d;
+        }
+        .endpoints h3 { margin-bottom: 10px; }
+        .endpoint { 
+            padding: 5px 10px; 
+            margin: 3px 0; 
+            background: #0d1117; 
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .method { 
+            display: inline-block; 
+            padding: 2px 6px; 
+            border-radius: 3px; 
+            font-weight: bold; 
+            margin-right: 8px;
+            font-size: 11px;
+        }
+        .get { background: #238636; color: white; }
+        .post { background: #1f6feb; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 MixVibe Mirror Admin</h1>
+        <p style="color: #8b949e; margin-bottom: 20px;">Extraction Control Panel</p>
+        
+        <div class="stats" id="stats">
+            <div class="stat"><div class="value" id="valBatches">-</div><div class="label">Batches</div></div>
+            <div class="stat"><div class="value" id="valDetails">-</div><div class="label">Details</div></div>
+            <div class="stat"><div class="value" id="valLive">-</div><div class="label">Live</div></div>
+            <div class="stat"><div class="value" id="valTopics">-</div><div class="label">Topics</div></div>
+            <div class="stat"><div class="value" id="valContent">-</div><div class="label">Content</div></div>
+            <div class="stat"><div class="value" id="valSize">-</div><div class="label">Total Size</div></div>
+        </div>
+        
+        <div class="buttons">
+            <button class="btn-extract" onclick="startExtract()" id="btnExtract">🔄 Start Extraction</button>
+            <button class="btn-refresh" onclick="loadStats()">🔃 Refresh Stats</button>
+            <button class="btn-export" onclick="exportData()">📥 Export Data</button>
+        </div>
+        
+        <div class="status">
+            <div class="title">📊 Status: <span id="statusText">Idle</span></div>
+            <div class="progress"><div class="fill" id="progressBar"></div></div>
+            <div id="statusDetails" style="font-size: 13px; color: #8b949e;"></div>
+        </div>
+        
+        <div class="endpoints">
+            <h3>📡 API Endpoints</h3>
+            <div class="endpoint"><span class="method get">GET</span> /api/batches</div>
+            <div class="endpoint"><span class="method get">GET</span> /api/batchdetails?batchId=</div>
+            <div class="endpoint"><span class="method get">GET</span> /api/live?batchId=</div>
+            <div class="endpoint"><span class="method get">GET</span> /api/topics?batchId=&subjectId=</div>
+            <div class="endpoint"><span class="method get">GET</span> /api/content?batchId=&subjectId=&topicId=&contentType=</div>
+            <div class="endpoint"><span class="method get">GET</span> /api/stats</div>
+            <div class="endpoint"><span class="method post">POST</span> /api/extract</div>
+            <div class="endpoint"><span class="method get">GET</span> /health</div>
+        </div>
+        
+        <div class="log" id="log">
+            <div>> Server ready...</div>
+        </div>
+    </div>
+
+    <script>
+        let refreshInterval;
+        
+        function log(msg) {
+            const logDiv = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            logDiv.innerHTML += `<div>[${time}] ${msg}</div>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+            
+            // Keep only last 50 lines
+            const lines = logDiv.querySelectorAll('div');
+            if (lines.length > 50) lines[0].remove();
+        }
+        
+        async function loadStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                
+                document.getElementById('valBatches').textContent = data.files.batches?.count || 0;
+                document.getElementById('valDetails').textContent = data.files.batchdetails?.count || 0;
+                document.getElementById('valLive').textContent = data.files.live?.count || 0;
+                document.getElementById('valTopics').textContent = data.files.topics?.count || 0;
+                document.getElementById('valContent').textContent = data.files.content?.count || 0;
+                document.getElementById('valSize').textContent = data.totalSize?.mb || '0';
+                
+                if (data.extraction?.running) {
+                    const s = data.extraction.stats;
+                    document.getElementById('statusText').textContent = 
+                        `Running: ${s.processed}/${s.total} - ${s.currentBatch}`;
+                    const pct = s.total > 0 ? (s.processed / s.total * 100) : 0;
+                    document.getElementById('progressBar').style.width = pct + '%';
+                    document.getElementById('statusDetails').textContent = 
+                        `Subjects: ${s.totalSubjects} | Topics: ${s.totalTopics} | Content: ${s.totalContent}`;
+                    document.getElementById('btnExtract').disabled = true;
+                } else {
+                    document.getElementById('statusText').textContent = 'Idle';
+                    document.getElementById('progressBar').style.width = '0%';
+                    document.getElementById('statusDetails').textContent = '';
+                    document.getElementById('btnExtract').disabled = false;
+                }
+                
+                log(`Stats updated: ${data.files.batches?.count || 0} batches`);
+            } catch(e) {
+                log('Error: ' + e.message);
+            }
+        }
+        
+        async function startExtract() {
+            const btn = document.getElementById('btnExtract');
+            btn.disabled = true;
+            log('Starting extraction...');
+            
+            try {
+                const res = await fetch('/api/extract', { method: 'POST' });
+                const data = await res.json();
+                log('✅ ' + data.message);
+            } catch(e) {
+                log('❌ Error: ' + e.message);
+            }
+            
+            btn.disabled = false;
+            loadStats();
+        }
+        
+        function exportData() {
+            log('Opening export...');
+            window.open('/api/export', '_blank');
+        }
+        
+        // Initial load
+        log('Admin panel loaded');
+        loadStats();
+        
+        // Auto refresh every 3 seconds
+        refreshInterval = setInterval(loadStats, 3000);
+    </script>
+</body>
+</html>
