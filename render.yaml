@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: mixvibe-mirror
+    env: node
+    plan: free
+    buildCommand: ""
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: DOMAIN
+        value: xtaiirus.onrender.com
+    disk:
+      name: mixvibe-storage
+      mountPath: /opt/render/data
+      sizeGB: 1
