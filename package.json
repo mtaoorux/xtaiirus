@@ -1,0 +1,14 @@
+{
+  "name": "mixvibe-mirror",
+  "version": "1.0.0",
+  "description": "Standalone Node.js server that mirrors the MixVibe API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.x"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}
