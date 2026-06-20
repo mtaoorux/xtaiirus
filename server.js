@@ -1,13 +1,12 @@
+
 // server.js – MixVibe Mirror Backend (No Limits Edition - Data Protected)
 // Zero dependencies, Node.js 18+ required
 // Run: node server.js
-// Data stored in /data folder - NEVER overwritten or deleted
+// Data stored in /data folder - Saves immediately
 
 const http = require('http');
-const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { EventEmitter } = require('events');
 
 // ==================== Configuration ====================
@@ -18,11 +17,6 @@ const CONFIG = {
     DOMAIN: process.env.DOMAIN || 'localhost',
     NODE_ENV: process.env.NODE_ENV || 'development',
     
-    // SSL (for production)
-    SSL_ENABLED: process.env.SSL_ENABLED === 'true',
-    SSL_KEY: process.env.SSL_KEY_PATH || path.join(__dirname, 'certs', 'privkey.pem'),
-    SSL_CERT: process.env.SSL_CERT_PATH || path.join(__dirname, 'certs', 'fullchain.pem'),
-    
     // Source
     MIXVIBE_BASE: process.env.MIXVIBE_BASE || 'https://pw.mixvibe.site',
     SECURITY_TOKEN: process.env.SECURITY_TOKEN || 'sdjfgeoriughdritvtiuohdorsiugh',
@@ -32,6 +26,7 @@ const CONFIG = {
     
     // Storage
     DATA_DIR: process.env.DATA_DIR || path.join(__dirname, 'data'),
+    PUBLIC_DIR: path.join(__dirname, 'public'),
     
     // NO LIMITS - Extract EVERYTHING
     MAX_CONCURRENT: parseInt(process.env.MAX_CONCURRENT || '10'),
@@ -39,23 +34,23 @@ const CONFIG = {
     RETRY_DELAY: 1000,
     REQUEST_DELAY: 100,
     
-    // Auto extraction (disabled by default, enable with env var)
+    // Auto extraction
     EXTRACT_INTERVAL: parseInt(process.env.EXTRACT_INTERVAL || '0'),
-    
-    // Public directory for static files
-    PUBLIC_DIR: path.join(__dirname, 'public'),
 };
 
 // ==================== Ensure directories exist ====================
-const dirs = ['batches', 'batchdetails', 'live', 'topics', 'content', 'meta'];
-dirs.forEach(dir => {
+const DATA_TYPES = ['batches', 'batchdetails', 'live', 'topics', 'content', 'meta'];
+DATA_TYPES.forEach(dir => {
     const fullPath = path.join(CONFIG.DATA_DIR, dir);
-    if (!fs.existsSync(fullPath)) fs.mkdirSync(fullPath, { recursive: true });
+    if (!fs.existsSync(fullPath)) {
+        fs.mkdirSync(fullPath, { recursive: true });
+        console.log(`📁 Created directory: ${fullPath}`);
+    }
 });
 
-// Ensure public directory exists
 if (!fs.existsSync(CONFIG.PUBLIC_DIR)) {
     fs.mkdirSync(CONFIG.PUBLIC_DIR, { recursive: true });
+    console.log(`📁 Created public directory: ${CONFIG.PUBLIC_DIR}`);
 }
 
 // ==================== Storage Layer ====================
@@ -71,12 +66,11 @@ class StorageManager {
             content: {}
         };
         this.ensureDirectories();
-        this.loadIndex();
+        this.rebuildIndex();
     }
 
     ensureDirectories() {
-        const dirs = ['batches', 'batchdetails', 'live', 'topics', 'content', 'meta'];
-        dirs.forEach(dir => {
+        DATA_TYPES.forEach(dir => {
             const fullPath = path.join(this.dataDir, dir);
             if (!fs.existsSync(fullPath)) {
                 fs.mkdirSync(fullPath, { recursive: true });
@@ -84,25 +78,67 @@ class StorageManager {
         });
     }
 
+    rebuildIndex() {
+        console.log('🔍 Scanning existing data files...');
+        this.index = { batches: [], batchDetails: {}, live: {}, topics: {}, content: {} };
+        
+        DATA_TYPES.forEach(type => {
+            if (type === 'meta') return;
+            const dirPath = path.join(this.dataDir, type);
+            if (fs.existsSync(dirPath)) {
+                const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+                files.forEach(file => {
+                    const id = file.replace('.json', '');
+                    try {
+                        const data = JSON.parse(fs.readFileSync(path.join(dirPath, file), 'utf8'));
+                        if (type === 'batches') {
+                            this.index.batches.push({
+                                _id: id,
+                                name: data.name || data.batchName || id,
+                                timestamp: new Date().toISOString()
+                            });
+                        }
+                    } catch(e) {
+                        console.log(`⚠️ Error reading ${type}/${id}`);
+                    }
+                });
+            }
+        });
+        
+        console.log(`✅ Index built: ${this.index.batches.length} batches found`);
+        this.saveIndex();
+    }
+
     saveJSON(type, id, data) {
         const filePath = path.join(this.dataDir, type, `${id}.json`);
         
-        // 🔒 NEVER OVERWRITE EXISTING DATA
-        if (fs.existsSync(filePath)) {
-            return; // Skip - data already saved
-        }
-        
+        // ✅ Always save data
+        const isNew = !fs.existsSync(filePath);
         fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+        
+        // Verify file was written
+        if (fs.existsSync(filePath)) {
+            const stats = fs.statSync(filePath);
+            console.log(`   ${isNew ? '💾 Saved' : '🔄 Updated'}: ${type}/${id} (${(stats.size/1024).toFixed(1)} KB)`);
+        } else {
+            console.error(`   ❌ FAILED to save: ${type}/${id}`);
+        }
         
         // Update index
         if (type === 'batches') {
             const existing = this.index.batches.findIndex(b => b._id === id);
+            const batchEntry = {
+                _id: id,
+                name: data.name || data.batchName || id,
+                timestamp: new Date().toISOString()
+            };
             if (existing >= 0) {
-                this.index.batches[existing] = data;
+                this.index.batches[existing] = batchEntry;
             } else {
-                this.index.batches.push({ _id: id, name: data.name, timestamp: new Date().toISOString() });
+                this.index.batches.push(batchEntry);
             }
         } else {
+            if (!this.index[type]) this.index[type] = {};
             this.index[type][id] = {
                 timestamp: new Date().toISOString(),
                 size: JSON.stringify(data).length
@@ -117,7 +153,6 @@ class StorageManager {
     }
 
     loadJSON(type, id) {
-        // Check cache first
         const cached = this.cache.get(`${type}:${id}`);
         if (cached) return cached;
 
@@ -150,14 +185,25 @@ class StorageManager {
     }
 
     getAllBatchIds() {
-        return this.index.batches.map(b => b._id);
+        if (this.index.batches.length > 0) {
+            return this.index.batches.map(b => b._id);
+        }
+        
+        // Fallback: scan directory
+        const dir = path.join(this.dataDir, 'batches');
+        if (fs.existsSync(dir)) {
+            return fs.readdirSync(dir)
+                .filter(f => f.endsWith('.json'))
+                .map(f => f.replace('.json', ''));
+        }
+        
+        return [];
     }
 
     getStats() {
         const stats = {};
-        const types = ['batches', 'batchdetails', 'live', 'topics', 'content'];
-        
-        types.forEach(type => {
+        DATA_TYPES.forEach(type => {
+            if (type === 'meta') return;
             const dirPath = path.join(this.dataDir, type);
             if (fs.existsSync(dirPath)) {
                 const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
@@ -172,24 +218,12 @@ class StorageManager {
                 stats[type] = { count: 0, size: 0 };
             }
         });
-        
         return stats;
     }
 
     saveIndex() {
         const indexPath = path.join(this.dataDir, 'meta', 'index.json');
         fs.writeFileSync(indexPath, JSON.stringify(this.index, null, 2));
-    }
-
-    loadIndex() {
-        const indexPath = path.join(this.dataDir, 'meta', 'index.json');
-        if (fs.existsSync(indexPath)) {
-            try {
-                this.index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
-            } catch(e) {
-                console.log('Error loading index, starting fresh');
-            }
-        }
     }
 
     clearCache() {
@@ -203,20 +237,14 @@ class RateLimiter {
         this.windowMs = windowMs;
         this.maxRequests = maxRequests;
         this.clients = new Map();
-        
         setInterval(() => this.cleanup(), 60000);
     }
 
     isAllowed(clientIP) {
         const now = Date.now();
-        const clientData = this.clients.get(clientIP) || { requests: [], blocked: false };
-
+        const clientData = this.clients.get(clientIP) || { requests: [] };
         clientData.requests = clientData.requests.filter(time => now - time < this.windowMs);
-
-        if (clientData.requests.length >= this.maxRequests) {
-            return false;
-        }
-
+        if (clientData.requests.length >= this.maxRequests) return false;
         clientData.requests.push(now);
         this.clients.set(clientIP, clientData);
         return true;
@@ -226,9 +254,7 @@ class RateLimiter {
         const now = Date.now();
         for (const [ip, data] of this.clients.entries()) {
             data.requests = data.requests.filter(time => now - time < this.windowMs);
-            if (data.requests.length === 0) {
-                this.clients.delete(ip);
-            }
+            if (data.requests.length === 0) this.clients.delete(ip);
         }
     }
 }
@@ -244,19 +270,13 @@ class AuthManager {
     }
 
     async getToken() {
-        if (!this.tokens.idToken) {
-            await this.login();
-        }
+        if (!this.tokens.idToken) await this.login();
         return this.tokens.idToken;
     }
 
     async refreshToken() {
-        if (!this.tokens.refreshToken) {
-            console.log('No refresh token – doing full login');
-            return this.login();
-        }
+        if (!this.tokens.refreshToken) return this.login();
         
-        console.log('Refreshing auth token...');
         try {
             const resp = await fetch(
                 `https://securetoken.googleapis.com/v1/token?key=${CONFIG.FIREBASE_API_KEY}`,
@@ -267,52 +287,42 @@ class AuthManager {
                 }
             );
             
-            if (!resp.ok) {
-                console.log('Refresh failed – re‑logging in');
-                return this.login();
-            }
+            if (!resp.ok) return this.login();
             
             const data = await resp.json();
             this.tokens.idToken = data.id_token;
             this.tokens.refreshToken = data.refresh_token;
-            console.log('Auth token refreshed successfully');
             return this.tokens.idToken;
         } catch (error) {
-            console.error('Refresh error:', error.message);
             return this.login();
         }
     }
 
     async login() {
-        console.log('Logging into MixVibe...');
-        try {
-            const resp = await fetch(
-                `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${CONFIG.FIREBASE_API_KEY}`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        email: CONFIG.MIXVIBE_EMAIL,
-                        password: CONFIG.MIXVIBE_PASSWORD,
-                        returnSecureToken: true
-                    })
-                }
-            );
-            
-            if (!resp.ok) {
-                const err = await resp.json().catch(() => ({}));
-                throw new Error(`Login failed: ${err.error?.message || resp.status}`);
+        console.log('🔑 Logging into MixVibe...');
+        const resp = await fetch(
+            `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${CONFIG.FIREBASE_API_KEY}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    email: CONFIG.MIXVIBE_EMAIL,
+                    password: CONFIG.MIXVIBE_PASSWORD,
+                    returnSecureToken: true
+                })
             }
-            
-            const data = await resp.json();
-            this.tokens.idToken = data.id_token;
-            this.tokens.refreshToken = data.refresh_token;
-            console.log('Successfully logged in');
-            return this.tokens.idToken;
-        } catch (error) {
-            console.error('Login error:', error.message);
-            throw error;
+        );
+        
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(`Login failed: ${err.error?.message || resp.status}`);
         }
+        
+        const data = await resp.json();
+        this.tokens.idToken = data.id_token;
+        this.tokens.refreshToken = data.refresh_token;
+        console.log('✅ Logged in successfully');
+        return this.tokens.idToken;
     }
 }
 
@@ -320,8 +330,6 @@ class AuthManager {
 class MixVibeClient {
     constructor(authManager) {
         this.auth = authManager;
-        this.requestCount = 0;
-        this.lastRequestTime = Date.now();
     }
 
     async apiCall(endpoint, retries = CONFIG.RETRY_ATTEMPTS) {
@@ -345,34 +353,26 @@ class MixVibeClient {
                 });
                 
                 clearTimeout(timeout);
-                this.requestCount++;
                 
                 if (resp.status === 401) {
-                    console.log('Auth expired – refreshing token');
                     token = await this.auth.refreshToken();
                     continue;
                 }
                 
                 if (resp.status === 429) {
                     const wait = Math.min(+(resp.headers.get('Retry-After') || 5), 15);
-                    console.log(`Rate limited, waiting ${wait}s...`);
+                    console.log(`⏳ Rate limited, waiting ${wait}s...`);
                     await new Promise(r => setTimeout(r, wait * 1000));
                     continue;
                 }
                 
-                if (!resp.ok) {
-                    throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-                }
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 
-                const data = await resp.json();
-                return data;
+                return await resp.json();
             } catch (e) {
-                if (e.name === 'AbortError') {
-                    console.log(`Request timeout for ${endpoint}`);
-                }
+                if (e.name === 'AbortError') console.log(`Timeout: ${endpoint}`);
                 if (attempt === retries) throw e;
                 const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, attempt);
-                console.log(`Retry ${attempt + 1}/${retries} after ${delay}ms...`);
                 await new Promise(r => setTimeout(r, delay));
             }
         }
@@ -400,9 +400,7 @@ class ExtractionEngine {
     }
 
     async extractAll() {
-        if (this.running) {
-            throw new Error('Extraction already in progress');
-        }
+        if (this.running) throw new Error('Extraction already in progress');
 
         this.running = true;
         this.stats = {
@@ -421,30 +419,25 @@ class ExtractionEngine {
         extractionEvents.emit('extraction:start', this.stats);
 
         try {
-            console.log('🚀 Starting extraction (NEW BATCHES ONLY)...');
+            console.log('\n🚀 Starting extraction...');
             const { batches } = await this.client.apiCall('/api/batches');
             
             if (!batches || !Array.isArray(batches)) {
                 throw new Error('Invalid batches response');
             }
 
-            console.log(`Found ${batches.length} total batches in source`);
+            console.log(`📦 Source has ${batches.length} batches`);
             
-            const existingIds = new Set(this.storage.getAllBatchIds());
-            const newBatches = batches.filter(b => !existingIds.has(b._id));
-
-            if (newBatches.length === 0) {
-                console.log('✅ No new batches to extract. All data is safe!');
-                this.stats.total = batches.length;
-                this.stats.processed = batches.length;
+            if (batches.length === 0) {
+                console.log('No batches to process');
                 extractionEvents.emit('extraction:complete', this.stats);
-                return { added: 0, total: batches.length };
+                return { added: 0, total: 0 };
             }
 
-            console.log(`🆕 Found ${newBatches.length} NEW batches to extract`);
-            this.stats.total = newBatches.length;
+            this.stats.total = batches.length;
 
-            const chunks = this.chunkArray(newBatches, CONFIG.MAX_CONCURRENT);
+            // Process ALL batches
+            const chunks = this.chunkArray(batches, CONFIG.MAX_CONCURRENT);
             
             for (const chunk of chunks) {
                 await Promise.allSettled(
@@ -453,22 +446,24 @@ class ExtractionEngine {
                 await new Promise(r => setTimeout(r, CONFIG.REQUEST_DELAY));
             }
 
+            // Save final stats
             this.stats.lastRun = new Date().toISOString();
             this.storage.saveJSON('meta', 'extraction-stats', this.stats);
+            this.storage.saveIndex();
 
-            console.log(`✅ Extraction complete: ${this.stats.processed} new batches processed`);
-            console.log(`💾 Total batches in storage: ${this.storage.getAllBatchIds().length}`);
-            console.log(`   Subjects: ${this.stats.totalSubjects}, Topics: ${this.stats.totalTopics}, Content: ${this.stats.totalContent}`);
+            console.log(`\n✅ Extraction complete!`);
+            console.log(`   Processed: ${this.stats.processed} batches`);
+            console.log(`   Subjects: ${this.stats.totalSubjects}`);
+            console.log(`   Topics: ${this.stats.totalTopics}`);
+            console.log(`   Content: ${this.stats.totalContent}`);
+            console.log(`   Storage: ${this.storage.getAllBatchIds().length} total batches\n`);
             
             extractionEvents.emit('extraction:complete', this.stats);
 
-            return {
-                added: newBatches.length,
-                total: batches.length,
-                stats: this.stats
-            };
+            return { added: this.stats.processed, total: batches.length, stats: this.stats };
+            
         } catch (error) {
-            console.error('Extraction failed:', error);
+            console.error('❌ Extraction failed:', error.message);
             this.stats.errors.push(error.message);
             extractionEvents.emit('extraction:error', error);
             throw error;
@@ -480,18 +475,21 @@ class ExtractionEngine {
     async processBatchComplete(batch) {
         try {
             this.stats.currentBatch = batch.name || batch._id;
-            console.log(`\n📦 Processing: ${batch.name} (${this.stats.processed + 1}/${this.stats.total})`);
+            console.log(`\n📦 [${this.stats.processed + 1}/${this.stats.total}] ${batch.name || batch._id}`);
 
+            // Save batch immediately
             this.storage.saveJSON('batches', batch._id, batch);
 
+            // Fetch live classes
             await this.fetchAllLive(batch._id);
             await new Promise(r => setTimeout(r, CONFIG.REQUEST_DELAY));
 
+            // Fetch batch details
             const details = await this.fetchBatchDetails(batch._id);
             
             if (details && details.data && details.data.subjects) {
                 const subjects = details.data.subjects;
-                console.log(`  📚 Found ${subjects.length} subjects`);
+                console.log(`  📚 ${subjects.length} subjects`);
                 
                 for (const subject of subjects) {
                     await this.fetchAllTopics(batch._id, subject);
@@ -504,7 +502,7 @@ class ExtractionEngine {
             extractionEvents.emit('extraction:progress', this.stats);
 
         } catch (error) {
-            console.error(`Error processing batch ${batch._id}:`, error.message);
+            console.error(`  ❌ Error: ${error.message}`);
             this.stats.errors.push(`Batch ${batch._id}: ${error.message}`);
         }
     }
@@ -512,24 +510,24 @@ class ExtractionEngine {
     async fetchAllLive(batchId) {
         try {
             const liveData = await this.client.apiCall(`/api/live?batchId=${batchId}`);
-            if (liveData && liveData.data && liveData.data.length > 0) {
+            if (liveData?.data?.length > 0) {
                 this.storage.saveJSON('live', batchId, liveData);
-                console.log(`  📡 Live classes: ${liveData.data.length}`);
+                console.log(`  📡 Live: ${liveData.data.length}`);
             }
         } catch (error) {
-            this.stats.warnings.push(`Live fetch for ${batchId}: ${error.message}`);
+            this.stats.warnings.push(`Live: ${error.message}`);
         }
     }
 
     async fetchBatchDetails(batchId) {
         try {
             const details = await this.client.apiCall(`/api/batchdetails?batchId=${batchId}`);
-            if (details && details.success && details.data) {
+            if (details?.success && details.data) {
                 this.storage.saveJSON('batchdetails', batchId, details);
                 return details;
             }
         } catch (error) {
-            this.stats.warnings.push(`Details fetch for ${batchId}: ${error.message}`);
+            this.stats.warnings.push(`Details: ${error.message}`);
         }
         return null;
     }
@@ -540,7 +538,7 @@ class ExtractionEngine {
                 `/api/topics?batchId=${batchId}&subjectId=${subject._id}`
             );
             
-            if (topicData && topicData.success && topicData.data) {
+            if (topicData?.success && topicData.data) {
                 const key = `${batchId}_${subject._id}`;
                 this.storage.saveJSON('topics', key, topicData);
                 
@@ -554,7 +552,7 @@ class ExtractionEngine {
                 }
             }
         } catch (error) {
-            this.stats.warnings.push(`Topics fetch for ${batchId}/${subject._id}: ${error.message}`);
+            this.stats.warnings.push(`Topics: ${error.message}`);
         }
     }
 
@@ -567,7 +565,7 @@ class ExtractionEngine {
                     `/api/content?batchId=${batchId}&subjectId=${subjectId}&topicId=${topicId}&contentType=${type}`
                 );
                 
-                if (content && content.success && content.data && content.data.length > 0) {
+                if (content?.success && content.data?.length > 0) {
                     const key = `${batchId}_${subjectId}_${topicId}_${type}`;
                     this.storage.saveJSON('content', key, content);
                     this.stats.totalContent++;
@@ -620,19 +618,16 @@ class Router {
         this.addRoute('GET', '/api/export', this.handleExport.bind(this));
         this.addRoute('GET', '/health', this.handleHealth.bind(this));
         
-        // Static files from /public folder
+        // Static files
         this.addRoute('GET', '/', this.serveAdminHTML.bind(this));
         this.addRoute('GET', '/admin', this.serveAdminHTML.bind(this));
     }
 
     addRoute(method, path, handler) {
-        if (!this.routes.has(method)) {
-            this.routes.set(method, new Map());
-        }
+        if (!this.routes.has(method)) this.routes.set(method, new Map());
         this.routes.get(method).set(path, handler);
     }
 
-    // 🆕 Serve static files
     serveFile(filePath, contentType, res) {
         try {
             if (!fs.existsSync(filePath)) {
@@ -649,7 +644,6 @@ class Router {
         }
     }
 
-    // 🆕 Handle all static file requests
     async handleStatic(req, res) {
         const url = new URL(req.url, `http://${req.headers.host}`);
         const pathname = url.pathname;
@@ -667,9 +661,8 @@ class Router {
         
         const ext = path.extname(pathname);
         const contentType = mimeTypes[ext] || 'text/plain';
-        
-        // Security: prevent directory traversal
         const safePath = path.normalize(path.join(CONFIG.PUBLIC_DIR, pathname));
+        
         if (!safePath.startsWith(CONFIG.PUBLIC_DIR)) {
             res.writeHead(403);
             res.end('Forbidden');
@@ -692,12 +685,10 @@ class Router {
         const method = req.method;
         const pathname = url.pathname;
 
-        // CORS headers
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-        res.setHeader('X-Powered-By', 'MixVibe Mirror - Unlimited Edition');
-        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('X-Powered-By', 'MixVibe Mirror');
 
         if (method === 'OPTIONS') {
             res.writeHead(204);
@@ -705,7 +696,6 @@ class Router {
             return;
         }
 
-        // Check API routes first
         const methodRoutes = this.routes.get(method);
         if (methodRoutes) {
             const handler = methodRoutes.get(pathname);
@@ -713,14 +703,13 @@ class Router {
                 try {
                     await handler(req, res, url.searchParams);
                 } catch (error) {
-                    console.error('Route handler error:', error);
+                    console.error('Route error:', error);
                     this.sendError(res, 500, 'Internal server error');
                 }
                 return;
             }
         }
 
-        // If not an API route, try to serve static file
         if (method === 'GET') {
             await this.handleStatic(req, res);
             return;
@@ -729,44 +718,44 @@ class Router {
         this.sendError(res, 404, 'Not found');
     }
 
-    // 🆕 Serve admin.html from /public folder
     async serveAdminHTML(req, res, params) {
         const filePath = path.join(CONFIG.PUBLIC_DIR, 'admin.html');
         if (!fs.existsSync(filePath)) {
-            // Fallback: show embedded admin if file doesn't exist
             res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(this.getFallbackAdminHTML());
+            res.end(this.getFallbackHTML());
             return;
         }
         this.serveFile(filePath, 'text/html', res);
     }
 
-    // Fallback admin HTML
-    getFallbackAdminHTML() {
+    getFallbackHTML() {
         return `<!DOCTYPE html>
 <html>
 <head>
     <title>MixVibe Mirror</title>
     <style>
         body { font-family: system-ui; background: #0d1117; color: #c9d1d9; padding: 2rem; }
-        button { padding: 1rem 2rem; background: #238636; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 1rem; }
+        button { padding: 1rem 2rem; background: #238636; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 1rem; margin: 0.5rem; }
         button:hover { background: #2ea043; }
         button:disabled { opacity: 0.5; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 2rem 0; }
-        .stat { background: #161b22; padding: 1.5rem; border-radius: 8px; text-align: center; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; margin: 2rem 0; }
+        .stat { background: #161b22; padding: 1rem; border-radius: 8px; text-align: center; }
         .stat-value { font-size: 2rem; color: #58a6ff; font-weight: bold; }
-        .stat-label { color: #8b949e; margin-top: 0.5rem; }
+        .stat-label { color: #8b949e; margin-top: 0.3rem; font-size: 0.8rem; }
+        .terminal { background: #000; color: #00ff00; padding: 1rem; border-radius: 8px; font-family: monospace; max-height: 300px; overflow-y: auto; margin-top: 1rem; }
     </style>
 </head>
 <body>
-    <h1>🔴 MixVibe Mirror Server</h1>
-    <p>Place <code>admin.html</code>, <code>style.css</code>, and <code>script.js</code> in the <code>/public</code> folder</p>
+    <h1>🚀 MixVibe Mirror</h1>
+    <p>Place admin.html, style.css, script.js in /public folder for full admin panel</p>
     <div class="stats">
         <div class="stat"><div class="stat-value" id="batches">-</div><div class="stat-label">Batches</div></div>
         <div class="stat"><div class="stat-value" id="content">-</div><div class="stat-label">Content</div></div>
     </div>
-    <button onclick="extract()">Start Extraction</button>
+    <button onclick="extract()">🔄 Extract</button>
+    <button onclick="loadStats()">🔃 Refresh</button>
     <div id="status"></div>
+    <div class="terminal" id="terminal"><div>> Ready...</div></div>
     <script>
         async function loadStats() {
             const r = await fetch('/api/stats');
@@ -777,13 +766,19 @@ class Router {
         async function extract() {
             document.querySelector('button').disabled = true;
             document.getElementById('status').textContent = 'Extracting...';
-            await fetch('/api/extract', { method: 'POST' });
+            document.getElementById('terminal').innerHTML += '<div>> Starting extraction...</div>';
+            try {
+                await fetch('/api/extract', { method: 'POST' });
+                document.getElementById('terminal').innerHTML += '<div>> ✅ Done!</div>';
+            } catch(e) {
+                document.getElementById('terminal').innerHTML += '<div>> ❌ Error: ' + e.message + '</div>';
+            }
             document.querySelector('button').disabled = false;
-            document.getElementById('status').textContent = 'Done!';
+            document.getElementById('status').textContent = '';
             loadStats();
         }
         loadStats();
-        setInterval(loadStats, 3000);
+        setInterval(loadStats, 5000);
     </script>
 </body>
 </html>`;
@@ -813,47 +808,32 @@ class Router {
         this.sendJSON(res, {
             success: true,
             batches,
-            pagination: {
-                page,
-                limit: limit || total,
-                total,
-                pages: limit > 0 ? Math.ceil(total / limit) : 1
-            },
+            pagination: { page, limit: limit || total, total, pages: limit > 0 ? Math.ceil(total / limit) : 1 },
             timestamp: new Date().toISOString()
         });
     }
 
     async handleGetBatchDetails(req, res, params) {
         const batchId = params.get('batchId');
-        if (!batchId) {
-            return this.sendError(res, 400, 'batchId is required');
-        }
+        if (!batchId) return this.sendError(res, 400, 'batchId is required');
         
         const details = this.storage.loadJSON('batchdetails', batchId);
-        if (!details) {
-            return this.sendError(res, 404, 'Batch details not found');
-        }
+        if (!details) return this.sendError(res, 404, 'Batch details not found');
         
         this.sendJSON(res, details);
     }
 
     async handleGetLive(req, res, params) {
         const batchId = params.get('batchId');
-        if (!batchId) {
-            return this.sendError(res, 400, 'batchId is required');
-        }
+        if (!batchId) return this.sendError(res, 400, 'batchId is required');
         
         const live = this.storage.loadJSON('live', batchId);
         this.sendJSON(res, live || { data: [] });
     }
 
     async handleGetTopics(req, res, params) {
-        const batchId = params.get('batchId');
-        const subjectId = params.get('subjectId');
-        
-        if (!batchId || !subjectId) {
-            return this.sendError(res, 400, 'batchId and subjectId are required');
-        }
+        const { batchId, subjectId } = params;
+        if (!batchId || !subjectId) return this.sendError(res, 400, 'batchId and subjectId required');
         
         const key = `${batchId}_${subjectId}`;
         const topics = this.storage.loadJSON('topics', key);
@@ -861,13 +841,9 @@ class Router {
     }
 
     async handleGetContent(req, res, params) {
-        const batchId = params.get('batchId');
-        const subjectId = params.get('subjectId');
-        const topicId = params.get('topicId');
-        const contentType = params.get('contentType');
-        
+        const { batchId, subjectId, topicId, contentType } = params;
         if (!batchId || !subjectId || !topicId || !contentType) {
-            return this.sendError(res, 400, 'All parameters are required');
+            return this.sendError(res, 400, 'All parameters required');
         }
         
         const key = `${batchId}_${subjectId}_${topicId}_${contentType}`;
@@ -880,11 +856,9 @@ class Router {
         const extractionStatus = this.extraction.getStatus();
         
         let totalSize = 0;
-        Object.values(fileStats).forEach(stat => {
-            totalSize += stat.size;
-        });
+        Object.values(fileStats).forEach(stat => totalSize += stat.size);
         
-        const stats = {
+        this.sendJSON(res, {
             success: true,
             files: fileStats,
             totalSize: {
@@ -900,24 +874,18 @@ class Router {
                 nodeVersion: process.version,
                 platform: process.platform
             }
-        };
-        
-        this.sendJSON(res, stats);
+        });
     }
 
     async handleExtract(req, res, params) {
         try {
-            if (this.extraction.running) {
-                return this.sendError(res, 409, 'Extraction already in progress');
-            }
+            if (this.extraction.running) return this.sendError(res, 409, 'Extraction already running');
             
-            this.extraction.extractAll().catch(err => {
-                console.error('Background extraction error:', err);
-            });
+            this.extraction.extractAll().catch(err => console.error('Background extraction error:', err));
             
             this.sendJSON(res, {
                 success: true,
-                message: 'Extraction started - only new batches will be added, existing data is safe',
+                message: 'Extraction started - data will be saved immediately',
                 timestamp: new Date().toISOString()
             });
         } catch (error) {
@@ -927,17 +895,13 @@ class Router {
 
     async handleExtractAll(req, res, params) {
         try {
-            if (this.extraction.running) {
-                return this.sendError(res, 409, 'Extraction already in progress');
-            }
+            if (this.extraction.running) return this.sendError(res, 409, 'Extraction already running');
             
-            this.extraction.extractAll().catch(err => {
-                console.error('Background extraction error:', err);
-            });
+            this.extraction.extractAll().catch(err => console.error('Background extraction error:', err));
             
             this.sendJSON(res, {
                 success: true,
-                message: 'Full extraction started - only new content will be added, nothing will be overwritten',
+                message: 'Full extraction started',
                 timestamp: new Date().toISOString()
             });
         } catch (error) {
@@ -947,80 +911,42 @@ class Router {
 
     async handleSearch(req, res, params) {
         const query = params.get('q')?.toLowerCase();
-        const type = params.get('type') || 'all';
+        if (!query) return this.sendError(res, 400, 'Search query required');
         
-        if (!query) {
-            return this.sendError(res, 400, 'Search query is required');
-        }
-        
-        const results = {
-            batches: [],
-            subjects: [],
-            topics: []
-        };
+        const results = { batches: [], subjects: [], topics: [] };
         
         const batches = this.storage.listJSON('batches');
         for (const batch of batches) {
-            if (batch.name?.toLowerCase().includes(query) ||
-                batch.description?.toLowerCase().includes(query)) {
+            if (batch.name?.toLowerCase().includes(query) || batch.description?.toLowerCase().includes(query)) {
                 results.batches.push(batch);
-            }
-        }
-        
-        const batchDetailsList = this.storage.listJSON('batchdetails');
-        for (const details of batchDetailsList) {
-            if (details.data?.subjects) {
-                for (const subject of details.data.subjects) {
-                    if (subject.name?.toLowerCase().includes(query)) {
-                        results.subjects.push({
-                            ...subject,
-                            batchId: details.data._id
-                        });
-                    }
-                }
             }
         }
         
         this.sendJSON(res, {
             success: true,
             query,
-            results: type === 'all' ? results : results[type] || [],
+            results,
             total: Object.values(results).reduce((sum, arr) => sum + arr.length, 0)
         });
     }
 
     async handleExport(req, res, params) {
-        const format = params.get('format') || 'json';
         const type = params.get('type') || 'all';
         
         try {
             const exportData = {
-                metadata: {
-                    exportedAt: new Date().toISOString(),
-                    version: '2.0',
-                    type: type
-                }
+                metadata: { exportedAt: new Date().toISOString(), version: '2.0', type }
             };
             
-            if (type === 'all' || type === 'batches') {
-                exportData.batches = this.storage.listJSON('batches');
-            }
-            if (type === 'all' || type === 'batchdetails') {
-                exportData.batchDetails = this.storage.listJSON('batchdetails');
-            }
-            if (type === 'all' || type === 'content') {
-                exportData.content = this.storage.listJSON('content');
-            }
+            if (type === 'all' || type === 'batches') exportData.batches = this.storage.listJSON('batches');
+            if (type === 'all' || type === 'batchdetails') exportData.batchDetails = this.storage.listJSON('batchdetails');
+            if (type === 'all' || type === 'content') exportData.content = this.storage.listJSON('content');
             
-            if (format === 'json') {
-                res.writeHead(200, {
-                    'Content-Type': 'application/json',
-                    'Content-Disposition': `attachment; filename=mixvibe-export-${Date.now()}.json`
-                });
-                res.end(JSON.stringify(exportData, null, 2));
-            } else {
-                this.sendError(res, 400, 'Unsupported format');
-            }
+            res.writeHead(200, {
+                'Content-Type': 'application/json',
+                'Content-Disposition': `attachment; filename=mixvibe-export-${Date.now()}.json`
+            });
+            res.end(JSON.stringify(exportData, null, 2));
         } catch (error) {
             this.sendError(res, 500, 'Export failed: ' + error.message);
         }
@@ -1039,18 +965,14 @@ class Router {
         const json = JSON.stringify(data, null, CONFIG.NODE_ENV === 'development' ? 2 : 0);
         res.writeHead(statusCode, {
             'Content-Type': 'application/json',
-            'Cache-Control': 'public, max-age=60',
+            'Cache-Control': 'no-cache',
             'Content-Length': Buffer.byteLength(json)
         });
         res.end(json);
     }
 
     sendError(res, statusCode, message) {
-        this.sendJSON(res, {
-            success: false,
-            error: message,
-            timestamp: new Date().toISOString()
-        }, statusCode);
+        this.sendJSON(res, { success: false, error: message, timestamp: new Date().toISOString() }, statusCode);
     }
 }
 
@@ -1066,9 +988,9 @@ class MixVibeMirrorServer {
     }
 
     async start() {
+        // Load existing stats
         const stats = this.storage.loadJSON('meta', 'extraction-stats');
         if (stats) {
-            console.log('Loaded existing extraction stats');
             this.extraction.stats = stats;
         }
 
@@ -1077,25 +999,21 @@ class MixVibeMirrorServer {
         });
 
         server.listen(CONFIG.PORT, CONFIG.HOST, () => {
+            console.log('\n' + '='.repeat(60));
+            console.log('🚀 MixVibe Mirror Server - READY');
             console.log('='.repeat(60));
-            console.log('🚀 MixVibe Mirror Server - UNLIMITED EDITION');
+            console.log(`📡 Server: http://${CONFIG.DOMAIN}:${CONFIG.PORT}`);
+            console.log(`🖥️  Admin: http://${CONFIG.DOMAIN}:${CONFIG.PORT}/admin`);
+            console.log(`💾 Storage: ${CONFIG.DATA_DIR}`);
+            console.log(`📦 Batches: ${this.storage.getAllBatchIds().length}`);
             console.log('='.repeat(60));
-            console.log('🔒 DATA PROTECTION: Never overwrites or deletes existing data');
-            console.log('💡 Only extracts NEW content not already in storage');
-            console.log('='.repeat(60));
-            console.log(`Server: http://${CONFIG.DOMAIN}:${CONFIG.PORT}`);
-            console.log(`Admin: http://${CONFIG.DOMAIN}:${CONFIG.PORT}/admin`);
-            console.log(`Storage: ${CONFIG.DATA_DIR}`);
-            console.log(`Public: ${CONFIG.PUBLIC_DIR}`);
-            console.log('='.repeat(60));
-            console.log('💡 Place admin.html in /public folder for full admin panel');
-            console.log('='.repeat(60));
+            console.log('💡 Data saves immediately after extraction');
+            console.log('💡 Check /api/batches to see your data');
+            console.log('='.repeat(60) + '\n');
             
             if (CONFIG.EXTRACT_INTERVAL > 0) {
-                console.log(`Auto-extraction every ${CONFIG.EXTRACT_INTERVAL}ms`);
-                setInterval(() => {
-                    this.extraction.extractAll().catch(console.error);
-                }, CONFIG.EXTRACT_INTERVAL);
+                console.log(`⏰ Auto-extraction every ${CONFIG.EXTRACT_INTERVAL}ms`);
+                setInterval(() => this.extraction.extractAll().catch(console.error), CONFIG.EXTRACT_INTERVAL);
             }
         });
 
@@ -1104,20 +1022,16 @@ class MixVibeMirrorServer {
     }
 
     shutdown(server) {
-        console.log('\nShutting down gracefully...');
+        console.log('\nShutting down...');
         server.close(() => {
             console.log('Server closed');
             process.exit(0);
         });
-        
-        setTimeout(() => {
-            console.log('Forced shutdown');
-            process.exit(1);
-        }, 10000);
+        setTimeout(() => process.exit(1), 10000);
     }
 }
 
 // ==================== Startup ====================
+console.log('🔧 Initializing MixVibe Mirror Server...\n');
 const server = new MixVibeMirrorServer();
 server.start().catch(console.error);
-                    
