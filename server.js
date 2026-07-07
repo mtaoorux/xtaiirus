@@ -7,13 +7,13 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
-const path = require('path');
 
 // Run auto setup if database doesn't exist
 const DB_PATH = process.env.DATABASE_PATH || './brainbox.db';
 if (!fs.existsSync(DB_PATH)) {
     console.log('📦 Database not found. Running auto setup...');
-    require('./auto-setup.js').autoSetup()
+    const { autoSetup } = require('./auto-setup.js');
+    autoSetup()
         .then(() => {
             console.log('✅ Setup completed. Starting server...');
             startServer();
