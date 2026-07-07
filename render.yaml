@@ -1,19 +1,14 @@
-# render.yaml
 services:
   - type: web
     name: brainbox-api
     env: node
-    buildCommand: npm run render-build
+    buildCommand: npm install
     startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 10000
-      - key: TOKEN
-        sync: false  # You'll set this in Render dashboard
-      - key: BASE_URL
-        value: https://nt.brainboxinstitute.in
       - key: CORS_ORIGIN
         value: *
       - key: RATE_LIMIT_WINDOW
