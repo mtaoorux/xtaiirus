@@ -1,15 +1,13 @@
 {
-  "name": "brainbox-api-v2",
+  "name": "brainbox-auto-api",
   "version": "2.0.0",
-  "description": "Brainbox Institute API - Deployed on Render",
+  "description": "Brainbox API - Auto extract, store & deploy",
   "main": "server.js",
   "scripts": {
-    "extract": "node extractBrainboxData.js",
-    "process": "node processAndStoreData.js",
+    "prestart": "node auto-setup.js",
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "build": "npm install && npm run extract && npm run process",
-    "render-build": "npm install && npm run extract && npm run process",
+    "render-build": "node auto-setup.js",
     "test": "node test-api.js"
   },
   "dependencies": {
@@ -20,7 +18,9 @@
     "dotenv": "^16.0.3",
     "helmet": "^7.0.0",
     "compression": "^1.7.4",
-    "express-rate-limit": "^6.7.0"
+    "express-rate-limit": "^6.7.0",
+    "cheerio": "^1.0.0-rc.12",
+    "puppeteer": "^21.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
