@@ -1,0 +1,12 @@
+# .gitignore
+node_modules/
+*.db
+*.db-journal
+extracted-data/
+.env
+.DS_Store
+*.log
+dist/
+build/
+coverage/
+.nyc_output/
