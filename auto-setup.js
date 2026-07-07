@@ -1,9 +1,8 @@
-// auto-setup.js - Fully automated extraction & storage
+// auto-setup.js - Simplified, no external dependencies
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
-const axios = require('axios');
 
 const DATA_DIR = './extracted-data';
 const DB_PATH = process.env.DATABASE_PATH || './brainbox.db';
@@ -20,13 +19,13 @@ const log = {
 
 // ============ CREATE SAMPLE DATA ============
 function createSampleData() {
-    log.section('CREATING SAMPLE DATA STRUCTURE');
+    log.section('CREATING DATA STRUCTURE');
     
     if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
     }
 
-    // Sample data structure - REPLACE WITH YOUR ACTUAL DATA
+    // Sample data - Replace with your actual data
     const sampleData = {
         batches: {
             data: [
