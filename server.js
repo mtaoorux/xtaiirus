@@ -11,7 +11,7 @@ const fs = require('fs');
 // Run auto setup if database doesn't exist
 const DB_PATH = process.env.DATABASE_PATH || './brainbox.db';
 if (!fs.existsSync(DB_PATH)) {
-    console.log('📦 Database not found. Running auto setup...');
+    console.log('📦 Database not found. Running auto setup from GitHub data...');
     const { autoSetup } = require('./auto-setup.js');
     autoSetup()
         .then(() => {
@@ -23,6 +23,7 @@ if (!fs.existsSync(DB_PATH)) {
             process.exit(1);
         });
 } else {
+    console.log('✅ Database found. Starting server...');
     startServer();
 }
 
@@ -89,8 +90,9 @@ function startServer() {
         res.json({
             name: 'Brainbox Institute API v2',
             version: '2.0.0',
-            description: 'Fully automated Brainbox API - No manual setup required',
+            description: 'Data stored in GitHub, auto-extracted on deployment',
             status: 'online',
+            dataSource: 'GitHub Repository',
             endpoints: {
                 'GET /': 'API documentation',
                 'GET /health': 'Health check',
@@ -582,6 +584,7 @@ function startServer() {
         console.log('='.repeat(60));
         console.log(`🌐 URL: http://localhost:${PORT}`);
         console.log(`📊 Database: ${DB_PATH}`);
+        console.log(`📁 Data Source: GitHub Repository (data/ folder)`);
         console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
         console.log('='.repeat(60));
         console.log('\n📡 Available Endpoints:');
