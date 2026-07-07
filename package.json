@@ -1,14 +1,31 @@
 {
-  "name": "mixvibe-mirror",
-  "version": "1.0.0",
-  "description": "Standalone Node.js server that mirrors the MixVibe API",
+  "name": "brainbox-api-v2",
+  "version": "2.0.0",
+  "description": "Brainbox Institute API - Deployed on Render",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "extract": "node extractBrainboxData.js",
+    "process": "node processAndStoreData.js",
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "build": "npm install && npm run extract && npm run process",
+    "render-build": "npm install && npm run extract && npm run process",
+    "test": "node test-api.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "sqlite3": "^5.1.6",
+    "dotenv": "^16.0.3",
+    "helmet": "^7.0.0",
+    "compression": "^1.7.4",
+    "express-rate-limit": "^6.7.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
   },
   "engines": {
-    "node": ">=18.x"
-  },
-  "dependencies": {},
-  "license": "MIT"
+    "node": "18.x"
+  }
 }
