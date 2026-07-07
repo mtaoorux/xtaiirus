@@ -4,7 +4,6 @@
   "description": "Brainbox API - Auto extract, store & deploy",
   "main": "server.js",
   "scripts": {
-    "prestart": "node auto-setup.js",
     "start": "node server.js",
     "dev": "nodemon server.js",
     "render-build": "node auto-setup.js",
@@ -12,15 +11,12 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.6.0",
     "cors": "^2.8.5",
     "sqlite3": "^5.1.6",
     "dotenv": "^16.0.3",
     "helmet": "^7.0.0",
     "compression": "^1.7.4",
-    "express-rate-limit": "^6.7.0",
-    "cheerio": "^1.0.0-rc.12",
-    "puppeteer": "^21.0.0"
+    "express-rate-limit": "^6.7.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
