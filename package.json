@@ -1,19 +1,14 @@
 {
-  "name": "asb-api-server",
+  "name": "cors-proxy",
   "version": "1.0.0",
-  "description": "ASB API Server for Nexttoppers Course Integration",
+  "description": "A minimal proxy that only adds CORS headers to allowlisted upstream URLs.",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "axios": "^1.6.0",
-    "dotenv": "^16.3.1"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0"
   }
 }
