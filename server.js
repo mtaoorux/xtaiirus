@@ -1,8 +1,7 @@
 /**
- * cors-proxy with video streaming support
+ * cors-proxy with enhanced video/CDN support
  * -----------------------------------------
- * Enhanced proxy that handles CORS bypass and video/audio streaming.
- * Supports range requests for media playback.
+ * Handles Google Cloud CDN, edge caching, and video streaming
  */
 
 const express = require('express');
@@ -18,15 +17,13 @@ const PORT = process.env.PORT || 8080;
 
 const ALLOWED_HOSTS = [
   'api.github.com',
+  'jsonplaceholder.typicode.com',
   'transcoded-videos.classx.co.in',
-  // Add video hosting domains you need:
-  // 'videos.example.com',
-  // 'cdn.example.com',
-  // '*.cloudfront.net',
+  '*.classx.co.in',  // Allows all subdomains
 ];
 
-const MAX_RESPONSE_BYTES = 100 * 1024 * 1024; // 100 MB for video
-const REQUEST_TIMEOUT_MS = 120_000; // 2 minutes for video
+const MAX_RESPONSE_BYTES = 200 * 1024 * 1024; // 200 MB for video
+const REQUEST_TIMEOUT_MS = 300_000; // 5 minutes for video
 
 // ---- Helpers ---------------------------------------------------------------
 
@@ -93,9 +90,10 @@ async function assertSafeTarget(targetUrl) {
 // CORS headers for ALL responses
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Origin');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS, POST');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Expose-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
   
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
@@ -103,7 +101,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Main proxy endpoint with streaming support
+// Main streaming endpoint - handles everything
 app.get('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) {
@@ -121,82 +119,113 @@ app.get('/proxy', async (req, res) => {
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    // Forward Range header for video streaming
+    // Mimic a browser's headers to get past CDN restrictions
     const headers = {
-      'User-Agent': 'cors-proxy/1.0',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'identity', // Don't accept compressed to stream properly
+      'Connection': 'keep-alive',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
     };
     
+    // Forward Range header for video seeking
     if (req.headers.range) {
       headers['Range'] = req.headers.range;
     }
 
-    const upstreamRes = await fetch(parsedTarget.toString(), {
-      method: 'GET',
-      redirect: 'manual',
-      signal: controller.signal,
-      headers: headers,
+    // Forward any other useful headers from the client
+    ['if-modified-since', 'if-none-match', 'if-range'].forEach(header => {
+      if (req.headers[header]) {
+        headers[header] = req.headers[header];
+      }
     });
 
-    // Handle redirects - follow them manually
-    if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
-      const location = upstreamRes.headers.get('location');
-      if (location) {
-        // Recursively follow redirect (with safety check)
-        const redirectUrl = new URL(location, parsedTarget).toString();
-        const redirectParsed = await assertSafeTarget(redirectUrl);
-        
-        const redirectHeaders = { ...headers };
-        const redirectRes = await fetch(redirectUrl, {
-          method: 'GET',
-          signal: controller.signal,
-          headers: redirectHeaders,
-        });
-        
-        // Forward response headers
-        res.status(redirectRes.status);
-        redirectRes.headers.forEach((value, key) => {
-          if (!key.toLowerCase().startsWith('access-control')) {
-            res.setHeader(key, value);
-          }
-        });
-        res.setHeader('Accept-Ranges', 'bytes');
-        
-        return redirectRes.body.pipe(res);
-      }
-    }
+    console.log(`Proxying: ${parsedTarget.toString()}`);
+    console.log('Request headers:', JSON.stringify(headers, null, 2));
 
-    // Set response status and headers
+    const upstreamRes = await fetch(parsedTarget.toString(), {
+      method: 'GET',
+      redirect: 'follow', // Follow redirects
+      signal: controller.signal,
+      headers: headers,
+      compress: false, // Don't decompress
+    });
+
+    console.log(`Response status: ${upstreamRes.status}`);
+    console.log('Response headers:', JSON.stringify(Object.fromEntries(upstreamRes.headers), null, 2));
+
+    // Set response status
     res.status(upstreamRes.status);
-    
-    // Forward all headers except CORS-related ones
+
+    // Forward ALL headers from upstream
     upstreamRes.headers.forEach((value, key) => {
-      if (!key.toLowerCase().startsWith('access-control')) {
+      // Skip headers that might conflict
+      const lowerKey = key.toLowerCase();
+      if (!['transfer-encoding', 'access-control-allow-origin', 'access-control-allow-methods', 'access-control-allow-headers'].includes(lowerKey)) {
         res.setHeader(key, value);
       }
     });
-    
-    // Ensure range support is indicated
-    res.setHeader('Accept-Ranges', 'bytes');
 
-    // Stream the response (important for video)
+    // Ensure these headers are set for video streaming
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', '*');
+    
+    // Add cache headers to work with Google Edge Cache
+    if (!upstreamRes.headers.has('cache-control')) {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    }
+
+    // Handle errors from upstream
+    if (upstreamRes.status >= 400) {
+      const errorBody = await upstreamRes.text();
+      console.error(`Upstream error ${upstreamRes.status}:`, errorBody.substring(0, 500));
+      return res.status(502).json({
+        error: `Upstream returned status ${upstreamRes.status}`,
+        details: errorBody.substring(0, 200)
+      });
+    }
+
+    // Stream the response
     if (upstreamRes.body) {
+      upstreamRes.body.on('error', (err) => {
+        console.error('Stream error:', err);
+        if (!res.headersSent) {
+          res.status(502).json({ error: 'Stream error' });
+        }
+      });
+
       upstreamRes.body.pipe(res);
+
+      // Handle client disconnect
+      req.on('close', () => {
+        console.log('Client disconnected');
+        upstreamRes.body.destroy();
+        controller.abort();
+      });
+
     } else {
       res.end();
     }
 
   } catch (err) {
+    console.error('Proxy error:', err);
     if (err.name === 'AbortError') {
       return res.status(504).json({ error: 'Upstream request timed out' });
     }
-    res.status(502).json({ error: 'Failed to fetch upstream URL' });
+    res.status(502).json({ 
+      error: 'Failed to fetch upstream URL',
+      message: err.message 
+    });
   } finally {
     clearTimeout(timeout);
   }
 });
 
-// Simple streaming proxy endpoint - just passes through everything
-app.get('/stream', async (req, res) => {
+// Direct video streaming endpoint
+app.get('/video', async (req, res) => {
   const target = req.query.url;
   if (!target) {
     return res.status(400).json({ error: 'Missing "url" query parameter' });
@@ -214,56 +243,112 @@ app.get('/stream', async (req, res) => {
 
   try {
     const headers = {
-      'User-Agent': 'cors-proxy/1.0',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'identity',
+      'Referer': parsedTarget.origin,
+      'Origin': parsedTarget.origin,
+      'Connection': 'keep-alive',
+      'Sec-Fetch-Dest': 'video',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'cross-site',
     };
     
-    // Forward range headers for video seeking
     if (req.headers.range) {
       headers['Range'] = req.headers.range;
     }
 
+    console.log(`Streaming video: ${parsedTarget.toString()}`);
+
     const upstreamRes = await fetch(parsedTarget.toString(), {
       method: 'GET',
-      redirect: 'follow', // Follow redirects for streaming
+      redirect: 'follow',
       signal: controller.signal,
       headers: headers,
+      compress: false,
     });
 
-    // Set CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    
-    // Copy status and headers
+    console.log(`Video status: ${upstreamRes.status}`);
+    console.log('Video headers:', Object.fromEntries(upstreamRes.headers));
+
     res.status(upstreamRes.status);
+
+    // Forward headers
     upstreamRes.headers.forEach((value, key) => {
-      if (!key.toLowerCase().startsWith('access-control')) {
+      const lowerKey = key.toLowerCase();
+      if (!['transfer-encoding', 'access-control-allow-origin'].includes(lowerKey)) {
         res.setHeader(key, value);
       }
     });
-    res.setHeader('Accept-Ranges', 'bytes');
 
-    // Pipe the stream
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    
     if (upstreamRes.body) {
       upstreamRes.body.pipe(res);
     }
-
   } catch (err) {
+    console.error('Video streaming error:', err);
     if (err.name === 'AbortError') {
-      return res.status(504).json({ error: 'Upstream request timed out' });
+      return res.status(504).json({ error: 'Video request timed out' });
     }
-    res.status(502).json({ error: 'Failed to fetch upstream URL' });
+    res.status(502).json({ 
+      error: 'Failed to stream video',
+      message: err.message 
+    });
   } finally {
     clearTimeout(timeout);
   }
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => {
+  res.json({ 
+    ok: true,
+    allowedHosts: ALLOWED_HOSTS,
+    uptime: process.uptime()
+  });
+});
+
+// Test endpoint to check if a URL is accessible
+app.get('/test', async (req, res) => {
+  const target = req.query.url;
+  if (!target) {
+    return res.status(400).json({ error: 'Missing "url" query parameter' });
+  }
+
+  try {
+    const parsedTarget = await assertSafeTarget(target);
+    
+    const testRes = await fetch(parsedTarget.toString(), {
+      method: 'HEAD',
+      redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+    });
+
+    res.json({
+      accessible: true,
+      status: testRes.status,
+      headers: Object.fromEntries(testRes.headers),
+    });
+  } catch (err) {
+    res.json({
+      accessible: false,
+      error: err.message,
+    });
+  }
+});
 
 app.listen(PORT, () => {
-  console.log(`cors-proxy listening on http://localhost:${PORT}`);
-  console.log(`Allowed hosts: ${ALLOWED_HOSTS.join(', ') || '(none configured!)'}`);
-  console.log('Endpoints:');
-  console.log('  /proxy?url=URL  - General proxy with redirect handling');
-  console.log('  /stream?url=URL - Streaming proxy for video/audio');
-  console.log('  /health         - Health check');
+  console.log(`🚀 cors-proxy running on http://localhost:${PORT}`);
+  console.log(`✅ Allowed hosts: ${ALLOWED_HOSTS.join(', ')}`);
+  console.log('\n📋 Available endpoints:');
+  console.log('  GET /proxy?url=URL  - General proxy');
+  console.log('  GET /video?url=URL  - Video streaming optimized');
+  console.log('  GET /test?url=URL   - Test if URL is accessible');
+  console.log('  GET /health         - Health check');
 });
