@@ -1,462 +1,183 @@
-// ==========================================================
-// ASB API SERVER - Nexttoppers Course Proxy
-// Direct API Integration with No Frontend Dependencies
-// ==========================================================
+/**
+ * cors-proxy
+ * -----------
+ * A minimal proxy whose only job is to fetch an allowlisted URL server-side
+ * and return it with permissive CORS headers, so a browser app can read a
+ * response that the origin server doesn't send CORS headers for.
+ *
+ * This is NOT a general-purpose open proxy. It intentionally:
+ *   - only proxies GET requests
+ *   - only proxies to domains you explicitly allow (see ALLOWED_HOSTS below)
+ *   - blocks requests to private/internal/loopback IPs (basic SSRF guard)
+ *   - caps response size and request time
+ *
+ * Run:
+ *   npm install
+ *   npm start
+ *
+ * Use from the browser:
+ *   fetch('http://localhost:8080/proxy?url=' + encodeURIComponent('https://example.com/api/data'))
+ */
 
 const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
+const fetch = require('node-fetch');
+const { URL } = require('url');
+const dns = require('dns').promises;
+const net = require('net');
+
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ---- Configuration -------------------------------------------------------
 
-// ==========================================
-// CONFIGURATION
-// ==========================================
-const CONFIG = {
-    // Nexttoppers API Headers
-    NT_HEADERS: {
-        'accept': 'application/json, text/plain, */*',
-        'app_id': '1772100600',
-        'authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjozMTY4MDcyLCJhcHBfaWQiOiIxNzcyMTAwNjAwIiwiZGV2aWNlX2lkIjoiNmZiYzk3OGYtYmEzZC00ZjcyLTg2ZTItZGI3OGI1MzY3YzQwIiwicGxhdGZvcm0iOiIzIiwidXNlcl90eXBlIjoxLCJpYXQiOjE3ODQ0NDMyNzgsImV4cCI6MTc4NzAzNTI3OH0.Ub-QZZHhSpS5i-GZRW79f29JlIHMCng90j6Q3QtlzcU',
-        'content-type': 'application/json',
-        'origin': 'https://missionjeet.in',
-        'platform': '3',
-        'referer': 'https://missionjeet.in/',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'user_id': '3168072',
-        'version': '1'
-    },
-    
-    // API Endpoints
-    API: {
-        OVERVIEW: 'https://course.nexttoppers.com/course/course-details',
-        CONTENT: 'https://course.nexttoppers.com/course/all-content',
-        MEDIA: 'https://course.nexttoppers.com/course/content-details',
-        CONTENT_DETAILS: 'https://sp-api-seven.vercel.app/api/content-details'
+// Only these hostnames may be proxied. Add the domains you actually need.
+// Wildcards like "*.example.com" are supported.
+const ALLOWED_HOSTS = [
+  'api.github.com',
+  'jsonplaceholder.typicode.com',
+  // 'api.example.com',
+];
+
+const MAX_RESPONSE_BYTES = 5 * 1024 * 1024; // 5 MB
+const REQUEST_TIMEOUT_MS = 10_000;
+
+// ---- Helpers ---------------------------------------------------------------
+
+function hostIsAllowed(hostname) {
+  return ALLOWED_HOSTS.some((pattern) => {
+    if (pattern.startsWith('*.')) {
+      const base = pattern.slice(2);
+      return hostname === base || hostname.endsWith('.' + base);
     }
-};
+    return hostname === pattern;
+  });
+}
 
-// ==========================================
-// CORE ASB API FUNCTIONS
-// ==========================================
+function isPrivateIp(ip) {
+  if (net.isIP(ip) === 0) return true; // not a valid IP -> treat as unsafe
+  // IPv4 private/reserved ranges + loopback + link-local + cloud metadata IP
+  const privateV4Patterns = [
+    /^127\./,
+    /^10\./,
+    /^169\.254\./, // includes 169.254.169.254 cloud metadata endpoint
+    /^192\.168\./,
+    /^172\.(1[6-9]|2\d|3[0-1])\./,
+    /^0\./,
+  ];
+  if (net.isIP(ip) === 4) {
+    return privateV4Patterns.some((re) => re.test(ip));
+  }
+  // IPv6: block loopback (::1), unique local (fc00::/7), link-local (fe80::/10)
+  const lower = ip.toLowerCase();
+  return (
+    lower === '::1' ||
+    lower.startsWith('fc') ||
+    lower.startsWith('fd') ||
+    lower.startsWith('fe80')
+  );
+}
 
-/**
- * Make ASB API Request to Nexttoppers
- */
-async function asbRequest(endpoint, method = 'POST', payload = null) {
-    try {
-        const response = await axios({
-            method: method,
-            url: endpoint,
-            headers: CONFIG.NT_HEADERS,
-            data: payload || {},
-            timeout: 30000
-        });
-        
-        return {
-            success: true,
-            data: response.data,
-            status: response.status
-        };
-    } catch (error) {
-        console.error('ASB API Error:', error.message);
-        
-        // Return error response
-        return {
-            success: false,
-            error: error.message,
-            status: error.response?.status || 500,
-            data: error.response?.data || null
-        };
+async function assertSafeTarget(targetUrl) {
+  let parsed;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    throw new Error('Invalid URL');
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only http/https URLs are allowed');
+  }
+
+  if (!hostIsAllowed(parsed.hostname)) {
+    throw new Error(`Host "${parsed.hostname}" is not in the allowlist`);
+  }
+
+  // Resolve DNS ourselves and reject if it points at a private/internal IP.
+  // This stops "allowed hostname that actually resolves to an internal IP"
+  // (DNS rebinding) style SSRF tricks.
+  const addresses = await dns.lookup(parsed.hostname, { all: true });
+  for (const { address } of addresses) {
+    if (isPrivateIp(address)) {
+      throw new Error('Target resolves to a disallowed private address');
     }
+  }
+
+  return parsed;
 }
 
-/**
- * Fetch Course Overview
- */
-async function getCourseOverview(courseId) {
-    const payload = {
-        course_id: String(courseId),
-        parent_id: "0"
-    };
-    
-    return await asbRequest(
-        CONFIG.API.OVERVIEW,
-        'POST',
-        payload
-    );
-}
+// ---- Routes ----------------------------------------------------------------
 
-/**
- * Fetch Course Content (Folders & Items)
- */
-async function getCourseContent(courseId, folderId = "0", limit = "1000", page = "1") {
-    const payload = {
-        course_id: String(courseId),
-        folder_id: String(folderId),
-        is_free: "",
-        keyword: "",
-        limit: String(limit),
-        page: String(page),
-        parent_course_id: "0"
-    };
-    
-    return await asbRequest(
-        CONFIG.API.CONTENT,
-        'POST',
-        payload
-    );
-}
+// Permissive CORS headers on every response from this proxy.
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
-/**
- * Fetch Media Details
- */
-async function getMediaDetails(contentId, courseId) {
-    const payload = {
-        content_id: String(contentId),
-        course_id: String(courseId)
-    };
-    
-    return await asbRequest(
-        CONFIG.API.MEDIA,
-        'POST',
-        payload
-    );
-}
+app.get('/proxy', async (req, res) => {
+  const target = req.query.url;
+  if (!target) {
+    return res.status(400).json({ error: 'Missing "url" query parameter' });
+  }
 
-/**
- * Get Content Details with Direct API (For PDFs/Documents)
- */
-async function getContentDetails(contentId, courseId) {
-    try {
-        const url = `${CONFIG.API.CONTENT_DETAILS}?content_id=${contentId}&course_id=${courseId}`;
-        const response = await axios({
-            method: 'GET',
-            url: url,
-            headers: CONFIG.NT_HEADERS,
-            timeout: 30000
-        });
-        
-        return {
-            success: true,
-            data: response.data,
-            status: response.status
-        };
-    } catch (error) {
-        return {
-            success: false,
-            error: error.message,
-            status: error.response?.status || 500
-        };
-    }
-}
+  let parsedTarget;
+  try {
+    parsedTarget = await assertSafeTarget(target);
+  } catch (err) {
+    return res.status(403).json({ error: err.message });
+  }
 
-// ==========================================
-// BATCH PROCESSING FUNCTIONS
-// ==========================================
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-/**
- * Get Multiple Course Overviews
- */
-async function getMultipleCourses(courseIds) {
-    const results = [];
-    
-    for (const id of courseIds) {
-        const data = await getCourseOverview(id);
-        results.push({
-            course_id: id,
-            data: data
-        });
-    }
-    
-    return results;
-}
-
-/**
- * Scan Course for Live Content
- */
-async function scanForLiveContent(courseId, maxDepth = 5) {
-    const liveItems = [];
-    const scannedFolders = new Set();
-    
-    async function scanFolder(folderId, depth = 0) {
-        if (depth > maxDepth || scannedFolders.has(folderId)) return;
-        scannedFolders.add(folderId);
-        
-        const content = await getCourseContent(courseId, folderId);
-        if (!content.success || !content.data || !content.data.data) return;
-        
-        const items = Array.isArray(content.data.data) 
-            ? content.data.data 
-            : (Array.isArray(content.data.data.list) ? content.data.data.list : []);
-        
-        const subFolders = [];
-        
-        for (const item of items) {
-            const type = (item.type || "").toLowerCase();
-            const d = item.data || {};
-            const vType = parseInt(item.video_type || d.video_type || 0);
-            
-            // Check for live content
-            if (vType === 3 || type === 'live' || 
-                parseInt(d.is_live) === 1 || parseInt(item.is_live) === 1) {
-                liveItems.push({
-                    ...item,
-                    parent_folder_id: folderId
-                });
-            }
-            
-            // Collect sub-folders
-            if (type === 'folder' || type === 'subject' || type === 'chapter') {
-                const id = d.id || item.entity_id || item.id;
-                if (id) subFolders.push(id);
-            }
-        }
-        
-        // Recursively scan sub-folders
-        for (const subId of subFolders) {
-            await scanFolder(subId, depth + 1);
-        }
-    }
-    
-    await scanFolder("0");
-    return liveItems;
-}
-
-// ==========================================
-// ROUTES
-// ==========================================
-
-// Health Check
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        version: '1.0.0'
+  try {
+    const upstreamRes = await fetch(parsedTarget.toString(), {
+      method: 'GET',
+      redirect: 'manual', // don't silently follow redirects off the allowlist
+      signal: controller.signal,
+      headers: { 'User-Agent': 'cors-proxy/1.0' },
     });
+
+    // Refuse to follow redirects automatically; tell the client instead.
+    if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
+      return res.status(502).json({
+        error: 'Upstream returned a redirect, which this proxy does not follow',
+      });
+    }
+
+    const contentLength = upstreamRes.headers.get('content-length');
+    if (contentLength && Number(contentLength) > MAX_RESPONSE_BYTES) {
+      return res.status(502).json({ error: 'Upstream response too large' });
+    }
+
+    res.status(upstreamRes.status);
+    const contentType = upstreamRes.headers.get('content-type');
+    if (contentType) res.setHeader('Content-Type', contentType);
+
+    const buffer = await upstreamRes.buffer();
+    if (buffer.length > MAX_RESPONSE_BYTES) {
+      return res.status(502).json({ error: 'Upstream response too large' });
+    }
+
+    res.send(buffer);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      return res.status(504).json({ error: 'Upstream request timed out' });
+    }
+    res.status(502).json({ error: 'Failed to fetch upstream URL' });
+  } finally {
+    clearTimeout(timeout);
+  }
 });
 
-// Get Course Overview
-app.get('/api/course/:courseId/overview', async (req, res) => {
-    const { courseId } = req.params;
-    const result = await getCourseOverview(courseId);
-    
-    if (result.success) {
-        res.json(result);
-    } else {
-        res.status(result.status || 500).json(result);
-    }
-});
-
-// Get Course Content
-app.get('/api/course/:courseId/content', async (req, res) => {
-    const { courseId } = req.params;
-    const { folder_id = "0", limit = "1000", page = "1" } = req.query;
-    
-    const result = await getCourseContent(courseId, folder_id, limit, page);
-    
-    if (result.success) {
-        res.json(result);
-    } else {
-        res.status(result.status || 500).json(result);
-    }
-});
-
-// Get Media Details
-app.get('/api/media/:contentId', async (req, res) => {
-    const { contentId } = req.params;
-    const { courseId } = req.query;
-    
-    if (!courseId) {
-        return res.status(400).json({
-            success: false,
-            error: 'courseId is required'
-        });
-    }
-    
-    const result = await getMediaDetails(contentId, courseId);
-    
-    if (result.success) {
-        res.json(result);
-    } else {
-        res.status(result.status || 500).json(result);
-    }
-});
-
-// Get Content Details (PDF/Document Support)
-app.get('/api/content-details/:contentId', async (req, res) => {
-    const { contentId } = req.params;
-    const { courseId } = req.query;
-    
-    if (!courseId) {
-        return res.status(400).json({
-            success: false,
-            error: 'courseId is required'
-        });
-    }
-    
-    const result = await getContentDetails(contentId, courseId);
-    
-    if (result.success) {
-        res.json(result);
-    } else {
-        res.status(result.status || 500).json(result);
-    }
-});
-
-// Scan for Live Content
-app.get('/api/course/:courseId/live', async (req, res) => {
-    const { courseId } = req.params;
-    const { maxDepth = 5 } = req.query;
-    
-    try {
-        const liveItems = await scanForLiveContent(courseId, parseInt(maxDepth));
-        res.json({
-            success: true,
-            data: liveItems,
-            count: liveItems.length
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Batch Course Overview
-app.post('/api/courses/batch', async (req, res) => {
-    const { courseIds } = req.body;
-    
-    if (!courseIds || !Array.isArray(courseIds)) {
-        return res.status(400).json({
-            success: false,
-            error: 'courseIds array is required'
-        });
-    }
-    
-    const results = await getMultipleCourses(courseIds);
-    res.json({
-        success: true,
-        data: results
-    });
-});
-
-// Generic Proxy - Forward any request to Nexttoppers
-app.post('/api/proxy', async (req, res) => {
-    const { target_url, method = 'POST', payload = null } = req.body;
-    
-    if (!target_url) {
-        return res.status(400).json({
-            success: false,
-            error: 'target_url is required'
-        });
-    }
-    
-    const result = await asbRequest(target_url, method, payload);
-    
-    if (result.success) {
-        res.json(result);
-    } else {
-        res.status(result.status || 500).json(result);
-    }
-});
-
-// ==========================================
-// BATCH SCANNER - Auto Discover Courses
-// ==========================================
-
-// Course ID ranges to scan
-const COURSE_IDS = [];
-for (let i = 185; i >= 184; i--) COURSE_IDS.push(i);
-for (let i = 152; i >= 151; i--) COURSE_IDS.push(i);
-for (let i = 161; i >= 160; i--) COURSE_IDS.push(i);
-
-// Discover all available courses
-app.get('/api/discover', async (req, res) => {
-    const results = [];
-    
-    for (const id of COURSE_IDS) {
-        try {
-            const overview = await getCourseOverview(id);
-            if (overview.success && overview.data && overview.data.data) {
-                const details = overview.data.data.find(d => d.type === 'overview');
-                if (details && details.data) {
-                    const layout = details.data.find(l => l.layout_type === 'details');
-                    if (layout && layout.layout_data && layout.layout_data[0]) {
-                        const batchInfo = layout.layout_data[0];
-                        results.push({
-                            id: id,
-                            title: batchInfo.title,
-                            thumbnail: batchInfo.thumbnail,
-                            price: batchInfo.offer_price || 0,
-                            mrp: batchInfo.mrp || 0,
-                            description: batchInfo.description
-                        });
-                    }
-                }
-            }
-        } catch (error) {
-            console.error(`Failed to fetch course ${id}:`, error.message);
-        }
-    }
-    
-    res.json({
-        success: true,
-        data: results,
-        count: results.length
-    });
-});
-
-// ==========================================
-// ERROR HANDLING
-// ==========================================
-
-// 404 Handler
-app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        error: 'Route not found',
-        path: req.originalUrl
-    });
-});
-
-// Global Error Handler
-app.use((err, req, res, next) => {
-    console.error('Server Error:', err);
-    res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-        message: err.message
-    });
-});
-
-// ==========================================
-// START SERVER
-// ==========================================
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
-    console.log(`========================================`);
-    console.log(`🚀 ASB API Server is running`);
-    console.log(`📡 Port: ${PORT}`);
-    console.log(`🌐 URL: http://localhost:${PORT}`);
-    console.log(`========================================`);
-    console.log(`📚 Available Routes:`);
-    console.log(`  GET  /health`);
-    console.log(`  GET  /api/course/:courseId/overview`);
-    console.log(`  GET  /api/course/:courseId/content`);
-    console.log(`  GET  /api/course/:courseId/live`);
-    console.log(`  GET  /api/media/:contentId?courseId=xxx`);
-    console.log(`  GET  /api/content-details/:contentId?courseId=xxx`);
-    console.log(`  POST /api/courses/batch`);
-    console.log(`  POST /api/proxy`);
-    console.log(`  GET  /api/discover`);
-    console.log(`========================================`);
+  console.log(`cors-proxy listening on http://localhost:${PORT}`);
+  console.log(`Allowed hosts: ${ALLOWED_HOSTS.join(', ') || '(none configured!)'}`);
 });
-
-module.exports = app;
