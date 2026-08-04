@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 8080;
 
 const ALLOWED_HOSTS = [
   'api.github.com',
-  'jsonplaceholder.typicode.com',
+  'transcoded-videos.classx.co.in',
   // Add video hosting domains you need:
   // 'videos.example.com',
   // 'cdn.example.com',
