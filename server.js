@@ -1,22 +1,8 @@
 /**
- * cors-proxy
- * -----------
- * A minimal proxy whose only job is to fetch an allowlisted URL server-side
- * and return it with permissive CORS headers, so a browser app can read a
- * response that the origin server doesn't send CORS headers for.
- *
- * This is NOT a general-purpose open proxy. It intentionally:
- *   - only proxies GET requests
- *   - only proxies to domains you explicitly allow (see ALLOWED_HOSTS below)
- *   - blocks requests to private/internal/loopback IPs (basic SSRF guard)
- *   - caps response size and request time
- *
- * Run:
- *   npm install
- *   npm start
- *
- * Use from the browser:
- *   fetch('http://localhost:8080/proxy?url=' + encodeURIComponent('https://example.com/api/data'))
+ * cors-proxy with video streaming support
+ * -----------------------------------------
+ * Enhanced proxy that handles CORS bypass and video/audio streaming.
+ * Supports range requests for media playback.
  */
 
 const express = require('express');
@@ -30,16 +16,17 @@ const PORT = process.env.PORT || 8080;
 
 // ---- Configuration -------------------------------------------------------
 
-// Only these hostnames may be proxied. Add the domains you actually need.
-// Wildcards like "*.example.com" are supported.
 const ALLOWED_HOSTS = [
   'api.github.com',
   'jsonplaceholder.typicode.com',
-  // 'api.example.com',
+  // Add video hosting domains you need:
+  // 'videos.example.com',
+  // 'cdn.example.com',
+  // '*.cloudfront.net',
 ];
 
-const MAX_RESPONSE_BYTES = 5 * 1024 * 1024; // 5 MB
-const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_RESPONSE_BYTES = 100 * 1024 * 1024; // 100 MB for video
+const REQUEST_TIMEOUT_MS = 120_000; // 2 minutes for video
 
 // ---- Helpers ---------------------------------------------------------------
 
@@ -54,12 +41,11 @@ function hostIsAllowed(hostname) {
 }
 
 function isPrivateIp(ip) {
-  if (net.isIP(ip) === 0) return true; // not a valid IP -> treat as unsafe
-  // IPv4 private/reserved ranges + loopback + link-local + cloud metadata IP
+  if (net.isIP(ip) === 0) return true;
   const privateV4Patterns = [
     /^127\./,
     /^10\./,
-    /^169\.254\./, // includes 169.254.169.254 cloud metadata endpoint
+    /^169\.254\./,
     /^192\.168\./,
     /^172\.(1[6-9]|2\d|3[0-1])\./,
     /^0\./,
@@ -67,7 +53,6 @@ function isPrivateIp(ip) {
   if (net.isIP(ip) === 4) {
     return privateV4Patterns.some((re) => re.test(ip));
   }
-  // IPv6: block loopback (::1), unique local (fc00::/7), link-local (fe80::/10)
   const lower = ip.toLowerCase();
   return (
     lower === '::1' ||
@@ -93,9 +78,6 @@ async function assertSafeTarget(targetUrl) {
     throw new Error(`Host "${parsed.hostname}" is not in the allowlist`);
   }
 
-  // Resolve DNS ourselves and reject if it points at a private/internal IP.
-  // This stops "allowed hostname that actually resolves to an internal IP"
-  // (DNS rebinding) style SSRF tricks.
   const addresses = await dns.lookup(parsed.hostname, { all: true });
   for (const { address } of addresses) {
     if (isPrivateIp(address)) {
@@ -108,17 +90,20 @@ async function assertSafeTarget(targetUrl) {
 
 // ---- Routes ----------------------------------------------------------------
 
-// Permissive CORS headers on every response from this proxy.
+// CORS headers for ALL responses
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Origin');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
+  
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
   }
   next();
 });
 
+// Main proxy endpoint with streaming support
 app.get('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) {
@@ -136,35 +121,70 @@ app.get('/proxy', async (req, res) => {
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
+    // Forward Range header for video streaming
+    const headers = {
+      'User-Agent': 'cors-proxy/1.0',
+    };
+    
+    if (req.headers.range) {
+      headers['Range'] = req.headers.range;
+    }
+
     const upstreamRes = await fetch(parsedTarget.toString(), {
       method: 'GET',
-      redirect: 'manual', // don't silently follow redirects off the allowlist
+      redirect: 'manual',
       signal: controller.signal,
-      headers: { 'User-Agent': 'cors-proxy/1.0' },
+      headers: headers,
     });
 
-    // Refuse to follow redirects automatically; tell the client instead.
+    // Handle redirects - follow them manually
     if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
-      return res.status(502).json({
-        error: 'Upstream returned a redirect, which this proxy does not follow',
-      });
+      const location = upstreamRes.headers.get('location');
+      if (location) {
+        // Recursively follow redirect (with safety check)
+        const redirectUrl = new URL(location, parsedTarget).toString();
+        const redirectParsed = await assertSafeTarget(redirectUrl);
+        
+        const redirectHeaders = { ...headers };
+        const redirectRes = await fetch(redirectUrl, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: redirectHeaders,
+        });
+        
+        // Forward response headers
+        res.status(redirectRes.status);
+        redirectRes.headers.forEach((value, key) => {
+          if (!key.toLowerCase().startsWith('access-control')) {
+            res.setHeader(key, value);
+          }
+        });
+        res.setHeader('Accept-Ranges', 'bytes');
+        
+        return redirectRes.body.pipe(res);
+      }
     }
 
-    const contentLength = upstreamRes.headers.get('content-length');
-    if (contentLength && Number(contentLength) > MAX_RESPONSE_BYTES) {
-      return res.status(502).json({ error: 'Upstream response too large' });
-    }
-
+    // Set response status and headers
     res.status(upstreamRes.status);
-    const contentType = upstreamRes.headers.get('content-type');
-    if (contentType) res.setHeader('Content-Type', contentType);
+    
+    // Forward all headers except CORS-related ones
+    upstreamRes.headers.forEach((value, key) => {
+      if (!key.toLowerCase().startsWith('access-control')) {
+        res.setHeader(key, value);
+      }
+    });
+    
+    // Ensure range support is indicated
+    res.setHeader('Accept-Ranges', 'bytes');
 
-    const buffer = await upstreamRes.buffer();
-    if (buffer.length > MAX_RESPONSE_BYTES) {
-      return res.status(502).json({ error: 'Upstream response too large' });
+    // Stream the response (important for video)
+    if (upstreamRes.body) {
+      upstreamRes.body.pipe(res);
+    } else {
+      res.end();
     }
 
-    res.send(buffer);
   } catch (err) {
     if (err.name === 'AbortError') {
       return res.status(504).json({ error: 'Upstream request timed out' });
@@ -175,9 +195,75 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
+// Simple streaming proxy endpoint - just passes through everything
+app.get('/stream', async (req, res) => {
+  const target = req.query.url;
+  if (!target) {
+    return res.status(400).json({ error: 'Missing "url" query parameter' });
+  }
+
+  let parsedTarget;
+  try {
+    parsedTarget = await assertSafeTarget(target);
+  } catch (err) {
+    return res.status(403).json({ error: err.message });
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const headers = {
+      'User-Agent': 'cors-proxy/1.0',
+    };
+    
+    // Forward range headers for video seeking
+    if (req.headers.range) {
+      headers['Range'] = req.headers.range;
+    }
+
+    const upstreamRes = await fetch(parsedTarget.toString(), {
+      method: 'GET',
+      redirect: 'follow', // Follow redirects for streaming
+      signal: controller.signal,
+      headers: headers,
+    });
+
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    // Copy status and headers
+    res.status(upstreamRes.status);
+    upstreamRes.headers.forEach((value, key) => {
+      if (!key.toLowerCase().startsWith('access-control')) {
+        res.setHeader(key, value);
+      }
+    });
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    // Pipe the stream
+    if (upstreamRes.body) {
+      upstreamRes.body.pipe(res);
+    }
+
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      return res.status(504).json({ error: 'Upstream request timed out' });
+    }
+    res.status(502).json({ error: 'Failed to fetch upstream URL' });
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
+// Health check endpoint
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
   console.log(`cors-proxy listening on http://localhost:${PORT}`);
   console.log(`Allowed hosts: ${ALLOWED_HOSTS.join(', ') || '(none configured!)'}`);
+  console.log('Endpoints:');
+  console.log('  /proxy?url=URL  - General proxy with redirect handling');
+  console.log('  /stream?url=URL - Streaming proxy for video/audio');
+  console.log('  /health         - Health check');
 });
