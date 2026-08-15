@@ -1,289 +1,394 @@
-/**
- * cors-proxy with debugging and Google CDN support
- */
-
 const express = require('express');
-const fetch = require('node-fetch');
-const { URL } = require('url');
-const dns = require('dns').promises;
-const net = require('net');
+const axios = require('axios');
+const fs = require('fs').promises;
+const path = require('path');
+const cors = require('cors');
+const morgan = require('morgan');
+require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 
-// ---- Configuration -------------------------------------------------------
+// Middleware
+app.use(cors());
+app.use(morgan('dev'));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-const ALLOWED_HOSTS = [
-  'api.github.com',
-  'jsonplaceholder.typicode.com',
-  'transcoded-videos.classx.co.in',
-  '*.classx.co.in',
-];
+// Constants
+const TOKEN_URL = 'https://mtaiirus.vercel.app/apv/tokenbyxyro-mtaiirus.json';
+const BASE_URL = process.env.BASE_URL || 'https://sachinacademyapi.classx.co.in';
+const ENDPOINT = '/get/fetchVideoDetailsById';
+const RESPONSES_DIR = path.join(__dirname, 'responses');
 
-// ---- Debug endpoint to test URLs ----
-app.get('/debug', async (req, res) => {
-  const target = req.query.url;
-  if (!target) {
-    return res.status(400).json({ error: 'Missing "url" query parameter' });
-  }
-
-  console.log('\n=== DEBUG START ===');
-  console.log('Original URL:', target);
-
-  try {
-    const parsed = new URL(target);
-    console.log('Parsed URL:', {
-      protocol: parsed.protocol,
-      hostname: parsed.hostname,
-      pathname: parsed.pathname,
-      search: parsed.search,
-      href: parsed.href
-    });
-
-    // Try different approaches
-    const results = {};
-
-    // 1. Direct request
+// Ensure responses directory exists
+async function ensureResponsesDir() {
     try {
-      console.log('\n--- Attempt 1: Direct request ---');
-      const res1 = await fetch(target, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        await fs.mkdir(RESPONSES_DIR, { recursive: true });
+    } catch (error) {
+        console.error('Error creating responses directory:', error);
+    }
+}
+
+// Fetch token from URL
+async function fetchToken() {
+    try {
+        console.log('📡 Fetching token from:', TOKEN_URL);
+        const response = await axios.get(TOKEN_URL, { timeout: 10000 });
+        const data = response.data;
+        
+        // Handle array of token objects
+        if (Array.isArray(data) && data.length > 0) {
+            // Try to find token for userId 1880403 (most recent)
+            let tokenEntry = data.find(item => item.userId === '1880403');
+            if (!tokenEntry) {
+                tokenEntry = data[0]; // Fallback to first token
+            }
+            if (tokenEntry && tokenEntry.token) {
+                let token = tokenEntry.token;
+                // Clean token - remove any extra characters
+                if (token.includes('\\n')) {
+                    token = token.replace(/\\n/g, '').trim();
+                }
+                console.log(`✅ Token fetched for userId: ${tokenEntry.userId}`);
+                return token;
+            }
         }
-      });
-      results.direct = {
-        status: res1.status,
-        headers: Object.fromEntries(res1.headers),
-        bodySample: (await res1.text()).substring(0, 500)
-      };
-      console.log('Direct request status:', res1.status);
-    } catch (e) {
-      results.direct = { error: e.message };
-      console.log('Direct request failed:', e.message);
+        
+        // If data is a single object with token
+        if (data.token) {
+            return data.token;
+        }
+        
+        throw new Error('No valid token found in response');
+    } catch (error) {
+        console.error('❌ Error fetching token:', error.message);
+        throw error;
     }
+}
 
-    // 2. Request with different path variations
-    const paths = [
-      parsed.pathname,
-      parsed.pathname.replace(/\/+/g, '/'), // Remove double slashes
-      '/' + parsed.pathname.split('/').filter(p => p).join('/'), // Normalize
-    ];
-
-    for (const path of paths) {
-      const testUrl = `${parsed.protocol}//${parsed.hostname}${path}${parsed.search || ''}`;
-      if (testUrl === target) continue; // Skip if same as original
-      
-      try {
-        console.log(`\n--- Attempt with path: ${path} ---`);
-        const res = await fetch(testUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          }
+// API: Fetch video details (GET)
+app.get('/api/video/details', async (req, res) => {
+    try {
+        const { course_id, video_id, ytflag = 0, folder_wise_course = 0 } = req.query;
+        
+        // Validate required parameters
+        if (!course_id || !video_id) {
+            return res.status(400).json({
+                success: false,
+                error: 'Missing required parameters: course_id and video_id are required'
+            });
+        }
+        
+        // Fetch token
+        let token;
+        try {
+            token = await fetchToken();
+        } catch (error) {
+            return res.status(401).json({
+                success: false,
+                error: 'Authentication failed: Unable to fetch token',
+                details: error.message
+            });
+        }
+        
+        // Construct URL with query parameters directly in URL
+        const url = `${BASE_URL}${ENDPOINT}?course_id=${course_id}&video_id=${video_id}&ytflag=${ytflag}&folder_wise_course=${folder_wise_course}&lc_app_api_url=`;
+        
+        console.log(`📡 Fetching from Sachin Academy API...`);
+        console.log(`🔗 URL: ${url}`);
+        console.log(`📚 Course ID: ${course_id}, Video ID: ${video_id}`);
+        
+        // Make API request
+        const response = await axios.get(url, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            timeout: 30000
         });
-        results[`path_${path}`] = {
-          url: testUrl,
-          status: res.status,
-          headers: Object.fromEntries(res.headers),
-        };
-        console.log('Path variation status:', res.status);
-      } catch (e) {
-        console.log('Path variation failed:', e.message);
-      }
+        
+        // Save response to file
+        const timestamp = Date.now();
+        const filename = `video_details_${course_id}_${video_id}_${timestamp}.json`;
+        await ensureResponsesDir();
+        const filePath = path.join(RESPONSES_DIR, filename);
+        await fs.writeFile(filePath, JSON.stringify(response.data, null, 2));
+        console.log(`💾 Response saved to ${filePath}`);
+        
+        // Return response
+        res.json({
+            success: true,
+            data: response.data,
+            saved_to: filename,
+            timestamp: new Date().toISOString(),
+            course_id: course_id,
+            video_id: video_id
+        });
+        
+    } catch (error) {
+        console.error('❌ Error fetching video details:', error.message);
+        
+        if (error.response) {
+            return res.status(error.response.status).json({
+                success: false,
+                error: 'API request failed',
+                status: error.response.status,
+                data: error.response.data
+            });
+        } else if (error.request) {
+            return res.status(503).json({
+                success: false,
+                error: 'No response from Sachin Academy API',
+                details: error.message
+            });
+        } else {
+            return res.status(500).json({
+                success: false,
+                error: 'Internal server error',
+                details: error.message
+            });
+        }
     }
+});
 
+// API: Fetch video details (POST)
+app.post('/api/video/fetch', async (req, res) => {
+    try {
+        const { course_id, video_id, ytflag = 0, folder_wise_course = 0 } = req.body;
+        
+        if (!course_id || !video_id) {
+            return res.status(400).json({
+                success: false,
+                error: 'Missing required fields: course_id and video_id'
+            });
+        }
+        
+        // Fetch token
+        const token = await fetchToken();
+        
+        // Construct URL
+        const url = `${BASE_URL}${ENDPOINT}?course_id=${course_id}&video_id=${video_id}&ytflag=${ytflag}&folder_wise_course=${folder_wise_course}&lc_app_api_url=`;
+        
+        console.log(`📡 Fetching from Sachin Academy API (POST)...`);
+        console.log(`🔗 URL: ${url}`);
+        
+        const response = await axios.get(url, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            timeout: 30000
+        });
+        
+        // Save response
+        const timestamp = Date.now();
+        const filename = `video_details_${course_id}_${video_id}_${timestamp}.json`;
+        await ensureResponsesDir();
+        const filePath = path.join(RESPONSES_DIR, filename);
+        await fs.writeFile(filePath, JSON.stringify(response.data, null, 2));
+        
+        res.json({
+            success: true,
+            data: response.data,
+            saved_to: filename,
+            timestamp: new Date().toISOString(),
+            course_id: course_id,
+            video_id: video_id
+        });
+        
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch video details',
+            details: error.message
+        });
+    }
+});
+
+// API: Fetch all course videos (optional)
+app.get('/api/course/:course_id/videos', async (req, res) => {
+    try {
+        const { course_id } = req.params;
+        const { ytflag = 0, folder_wise_course = 0 } = req.query;
+        
+        if (!course_id) {
+            return res.status(400).json({
+                success: false,
+                error: 'Course ID is required'
+            });
+        }
+        
+        // This endpoint could be extended to fetch multiple videos
+        // For now, we'll just return a list of saved responses for this course
+        await ensureResponsesDir();
+        const files = await fs.readdir(RESPONSES_DIR);
+        const courseFiles = files
+            .filter(file => file.includes(`_${course_id}_`))
+            .map(file => ({
+                filename: file,
+                path: `/api/responses/${file}`,
+                timestamp: file.replace('video_details_', '').replace('.json', '')
+            }));
+        
+        res.json({
+            success: true,
+            course_id: course_id,
+            count: courseFiles.length,
+            files: courseFiles
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch course videos',
+            details: error.message
+        });
+    }
+});
+
+// API: Fetch token status
+app.get('/api/token/status', async (req, res) => {
+    try {
+        const token = await fetchToken();
+        res.json({
+            success: true,
+            token_exists: true,
+            token_length: token.length,
+            token_preview: token.substring(0, 20) + '...',
+            source: TOKEN_URL,
+            base_url: BASE_URL
+        });
+    } catch (error) {
+        res.json({
+            success: false,
+            token_exists: false,
+            error: error.message,
+            source: TOKEN_URL,
+            base_url: BASE_URL
+        });
+    }
+});
+
+// API: Get all saved responses
+app.get('/api/responses', async (req, res) => {
+    try {
+        await ensureResponsesDir();
+        const files = await fs.readdir(RESPONSES_DIR);
+        const responseFiles = files
+            .filter(file => file.endsWith('.json'))
+            .map(file => {
+                // Extract course_id and video_id from filename
+                const parts = file.replace('video_details_', '').replace('.json', '').split('_');
+                let course_id = null;
+                let video_id = null;
+                let timestamp = parts[parts.length - 1];
+                
+                if (parts.length >= 3) {
+                    course_id = parts[0];
+                    video_id = parts[1];
+                }
+                
+                return {
+                    filename: file,
+                    path: `/api/responses/${file}`,
+                    course_id: course_id,
+                    video_id: video_id,
+                    timestamp: timestamp
+                };
+            })
+            .sort((a, b) => b.timestamp - a.timestamp);
+        
+        res.json({
+            success: true,
+            count: responseFiles.length,
+            files: responseFiles
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Failed to list responses',
+            details: error.message
+        });
+    }
+});
+
+// API: Get specific response
+app.get('/api/responses/:filename', async (req, res) => {
+    try {
+        const { filename } = req.params;
+        const filePath = path.join(RESPONSES_DIR, filename);
+        const data = await fs.readFile(filePath, 'utf8');
+        res.json(JSON.parse(data));
+    } catch (error) {
+        res.status(404).json({
+            success: false,
+            error: 'Response file not found'
+        });
+    }
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
     res.json({
-      originalUrl: target,
-      parsed: {
-        protocol: parsed.protocol,
-        hostname: parsed.hostname,
-        pathname: parsed.pathname,
-        search: parsed.search,
-      },
-      results
+        name: 'Sachin Academy Video API Server',
+        version: '1.0.0',
+        description: 'Fetches video details from Sachin Academy API',
+        base_url: BASE_URL,
+        token_source: TOKEN_URL,
+        endpoints: {
+            'GET /api/video/details': 'Fetch video details (params: course_id, video_id, ytflag, folder_wise_course)',
+            'POST /api/video/fetch': 'Fetch video details (body: course_id, video_id, ytflag, folder_wise_course)',
+            'GET /api/course/:course_id/videos': 'Get saved videos for a course',
+            'GET /api/responses': 'List saved responses',
+            'GET /api/responses/:filename': 'Get specific response file',
+            'GET /api/token/status': 'Check token status',
+            'GET /': 'This help message'
+        },
+        example: '/api/video/details?course_id=281&video_id=330105'
     });
-
-  } catch (err) {
-    res.json({
-      error: 'Failed to parse or fetch URL',
-      message: err.message,
-      stack: err.stack
-    });
-  }
-  console.log('=== DEBUG END ===\n');
 });
 
-// ---- Main proxy with better error handling ----
-app.get('/proxy', async (req, res) => {
-  const target = req.query.url;
-  if (!target) {
-    return res.status(400).json({ error: 'Missing "url" query parameter' });
-  }
-
-  // Parse the URL
-  let parsed;
-  try {
-    parsed = new URL(target);
-  } catch {
-    return res.status(400).json({ error: 'Invalid URL format' });
-  }
-
-  // Check if host is allowed
-  const isAllowed = ALLOWED_HOSTS.some(pattern => {
-    if (pattern.startsWith('*.')) {
-      const base = pattern.slice(2);
-      return parsed.hostname === base || parsed.hostname.endsWith('.' + base);
-    }
-    return parsed.hostname === pattern;
-  });
-
-  if (!isAllowed) {
-    return res.status(403).json({ 
-      error: `Host "${parsed.hostname}" is not allowed`,
-      allowedHosts: ALLOWED_HOSTS
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    res.status(500).json({
+        success: false,
+        error: 'Internal server error',
+        details: err.message
     });
-  }
+});
 
-  console.log(`Proxying: ${target}`);
-
-  try {
-    // Try with browser-like headers
-    const response = await fetch(target, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'identity',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'cross-site',
-      },
-      redirect: 'follow',
-      follow: 5,
-    });
-
-    console.log(`Response: ${response.status} ${response.statusText}`);
+// Start server
+app.listen(PORT, async () => {
+    await ensureResponsesDir();
+    console.log(`🚀 Sachin Academy Video API Server running on http://localhost:${PORT}`);
+    console.log(`🔗 Base URL: ${BASE_URL}`);
+    console.log(`🔗 Token source: ${TOKEN_URL}`);
+    console.log(`📁 Responses saved to: ${RESPONSES_DIR}`);
+    console.log('\n📋 Available endpoints:');
+    console.log(`  GET  /api/video/details?course_id=281&video_id=330105`);
+    console.log(`  POST /api/video/fetch (body: { course_id, video_id })`);
+    console.log(`  GET  /api/course/:course_id/videos`);
+    console.log(`  GET  /api/responses`);
+    console.log(`  GET  /api/token/status`);
+    console.log(`  GET  /`);
     
-    // Log response headers for debugging
-    const responseHeaders = Object.fromEntries(response.headers);
-    console.log('Response headers:', JSON.stringify(responseHeaders, null, 2));
-
-    // Set CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Expose-Headers', '*');
-
-    // If it's a 404, provide debugging info
-    if (response.status === 404) {
-      const body = await response.text();
-      console.log('404 Body:', body.substring(0, 500));
-      
-      return res.status(404).json({
-        error: 'File not found at the specified URL',
-        url: target,
-        hostname: parsed.hostname,
-        pathname: parsed.pathname,
-        debugInfo: body.substring(0, 300),
-        suggestion: 'Try the /debug?url= endpoint to test different URL variations'
-      });
+    // Test token on startup
+    try {
+        const token = await fetchToken();
+        console.log(`✅ Token verified (length: ${token.length})`);
+        console.log(`✅ Server ready to fetch from Sachin Academy API`);
+    } catch (error) {
+        console.log(`⚠️  Token verification failed: ${error.message}`);
+        console.log(`⚠️  Please check token source: ${TOKEN_URL}`);
     }
-
-    // Forward successful response
-    res.status(response.status);
-    
-    // Forward headers
-    response.headers.forEach((value, key) => {
-      if (!key.toLowerCase().startsWith('access-control')) {
-        res.setHeader(key, value);
-      }
-    });
-
-    res.setHeader('Accept-Ranges', 'bytes');
-
-    // Stream the response
-    if (response.body) {
-      response.body.pipe(res);
-    } else {
-      res.end();
-    }
-
-  } catch (err) {
-    console.error('Proxy error:', err);
-    res.status(502).json({
-      error: 'Failed to fetch URL',
-      message: err.message,
-      url: target
-    });
-  }
 });
 
-// ---- Video streaming specific endpoint ----
-app.get('/video', async (req, res) => {
-  const target = req.query.url;
-  if (!target) {
-    return res.status(400).json({ error: 'Missing "url" query parameter' });
-  }
-
-  // Quick host check
-  let parsed;
-  try {
-    parsed = new URL(target);
-  } catch {
-    return res.status(400).json({ error: 'Invalid URL' });
-  }
-
-  if (!ALLOWED_HOSTS.some(p => {
-    if (p.startsWith('*.')) {
-      const base = p.slice(2);
-      return parsed.hostname === base || parsed.hostname.endsWith('.' + base);
-    }
-    return parsed.hostname === p;
-  })) {
-    return res.status(403).json({ error: 'Host not allowed' });
-  }
-
-  console.log(`Streaming video: ${target}`);
-
-  try {
-    const response = await fetch(target, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8',
-        'Accept-Encoding': 'identity',
-        'Range': req.headers.range || '',
-        'Referer': `${parsed.protocol}//${parsed.hostname}/`,
-        'Origin': `${parsed.protocol}//${parsed.hostname}`,
-      },
-      redirect: 'follow',
-    });
-
-    res.status(response.status);
-    response.headers.forEach((value, key) => {
-      if (!key.toLowerCase().startsWith('access-control')) {
-        res.setHeader(key, value);
-      }
-    });
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Accept-Ranges', 'bytes');
-
-    if (response.body) {
-      response.body.pipe(res);
-    }
-  } catch (err) {
-    res.status(502).json({ error: 'Streaming failed', message: err.message });
-  }
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ ok: true, allowedHosts: ALLOWED_HOSTS });
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Proxy running on http://localhost:${PORT}`);
-  console.log('📋 Endpoints:');
-  console.log('  /proxy?url=URL  - Main proxy');
-  console.log('  /video?url=URL  - Video streaming');
-  console.log('  /debug?url=URL  - Debug URL issues');
-  console.log('  /health         - Health check');
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n👋 Shutting down server...');
+    process.exit(0);
 });
