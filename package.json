@@ -1,18 +1,15 @@
 {
   "name": "studybee-api",
   "version": "1.0.0",
-  "description": "StudyBee API server for Render deployment",
+  "description": "StudyBee API for Render",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "node-fetch": "^3.3.2",
-    "node-abort-controller": "^3.1.1"
+    "cors": "^2.8.5"
   },
   "engines": {
     "node": ">=18.0.0"
