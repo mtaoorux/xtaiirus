@@ -1,13 +1,10 @@
 // ============================================================================
-// STUDYBEE API SERVER — RENDER DEPLOYMENT
-// Anti-429 hardened: retry/backoff, in-memory cache, request coalescing,
-// concurrency limiting, and per-host rate limiting.
+// STUDYBEE API SERVER — RENDER DEPLOYMENT (WORKING STREAM PROXY)
 // ============================================================================
 
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
-import { AbortController as NodeAbortController } from "node-abort-controller";
+import { Readable } from "node:stream";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,22 +30,16 @@ const DEFAULT_TOPIC_ID = "1";
 const MAX_PAGES = 20;
 const PAGE_TIMEOUT = 15000;
 const PAGE_SIZE = 40;
-
-// Rate-limit safety
-const UPSTREAM_CONCURRENCY = 3;         // Never exceed 3 concurrent upstream calls
-const UPSTREAM_RETRIES = 5;             // Retry up to 5 times on 429/5xx
-const UPSTREAM_BASE_DELAY = 800;        // 800ms base backoff
-const UPSTREAM_MAX_DELAY = 15000;       // Cap at 15s
-const CACHE_TTL_MS = 60_000;            // Cache successful responses for 60s
-const RATE_LIMIT_COOLDOWN_MS = 30_000;  // If we get 429, pause that host for 30s
-const REQUEST_JITTER_MS = 150;          // Small random delay between calls
+const UPSTREAM_CONCURRENCY = 3;
+const UPSTREAM_RETRIES = 5;
+const UPSTREAM_BASE_DELAY = 800;
+const UPSTREAM_MAX_DELAY = 15000;
+const CACHE_TTL_MS = 60_000;
+const RATE_LIMIT_COOLDOWN_MS = 30_000;
+const REQUEST_JITTER_MS = 150;
 
 const ADMIN_KEYS = new Set(["shivuu", "adii"]);
 const ACTIVE_KEY = "shivuu";
-
-// ============================================================================
-// RESPONSE HEADERS
-// ============================================================================
 
 const HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -68,24 +59,20 @@ const PLAYER_HEADERS = {
 };
 
 // ============================================================================
-// IN-MEMORY CACHE (LRU-lite)
+// IN-MEMORY CACHE
 // ============================================================================
 
-const responseCache = new Map(); // key -> { data, expiry }
-const inflightRequests = new Map(); // key -> Promise (request coalescing)
+const responseCache = new Map();
+const inflightRequests = new Map();
 
 function cacheGet(key) {
     const entry = responseCache.get(key);
     if (!entry) return null;
-    if (Date.now() > entry.expiry) {
-        responseCache.delete(key);
-        return null;
-    }
+    if (Date.now() > entry.expiry) { responseCache.delete(key); return null; }
     return entry.data;
 }
 
 function cacheSet(key, data, ttl = CACHE_TTL_MS) {
-    // Simple size cap
     if (responseCache.size > 500) {
         const firstKey = responseCache.keys().next().value;
         responseCache.delete(firstKey);
@@ -93,24 +80,17 @@ function cacheSet(key, data, ttl = CACHE_TTL_MS) {
     responseCache.set(key, { data, expiry: Date.now() + ttl });
 }
 
-function cacheBust(key) {
-    responseCache.delete(key);
-}
-
 // ============================================================================
-// HOST-LEVEL RATE LIMIT COOLDOWN
+// HOST COOLDOWN
 // ============================================================================
 
-const hostCooldowns = new Map(); // host -> timestamp when usable again
+const hostCooldowns = new Map();
 
 function hostIsCoolingDown(host) {
     const until = hostCooldowns.get(host);
     if (!until) return 0;
     const remaining = until - Date.now();
-    if (remaining <= 0) {
-        hostCooldowns.delete(host);
-        return 0;
-    }
+    if (remaining <= 0) { hostCooldowns.delete(host); return 0; }
     return remaining;
 }
 
@@ -119,23 +99,16 @@ function setHostCooldown(host, ms = RATE_LIMIT_COOLDOWN_MS) {
 }
 
 // ============================================================================
-// GLOBAL CONCURRENCY LIMITER (queue)
+// CONCURRENCY LIMITER
 // ============================================================================
 
 class ConcurrencyLimiter {
-    constructor(max) {
-        this.max = max;
-        this.active = 0;
-        this.queue = [];
-    }
+    constructor(max) { this.max = max; this.active = 0; this.queue = []; }
     async run(fn) {
-        if (this.active >= this.max) {
-            await new Promise(resolve => this.queue.push(resolve));
-        }
+        if (this.active >= this.max) await new Promise(resolve => this.queue.push(resolve));
         this.active++;
-        try {
-            return await fn();
-        } finally {
+        try { return await fn(); }
+        finally {
             this.active--;
             const next = this.queue.shift();
             if (next) next();
@@ -149,13 +122,8 @@ const upstreamLimiter = new ConcurrencyLimiter(UPSTREAM_CONCURRENCY);
 // UTILS
 // ============================================================================
 
-function sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
-}
-
-function jitter(ms = REQUEST_JITTER_MS) {
-    return Math.floor(Math.random() * ms);
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function jitter(ms = REQUEST_JITTER_MS) { return Math.floor(Math.random() * ms); }
 
 function jsonResponse(res, payload, status = 200) {
     res.status(status).set(HEADERS).send(JSON.stringify(payload, null, 4));
@@ -176,9 +144,7 @@ function base64ToUint8Array(base64) {
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
         return bytes;
-    } catch {
-        return null;
-    }
+    } catch { return null; }
 }
 
 async function decrypt(enc) {
@@ -193,16 +159,10 @@ async function decrypt(enc) {
         if (!cipherBytes || !ivBytes || ivBytes.length !== 16) return null;
         const keyBytes = new TextEncoder().encode(DECRYPTION_KEY);
         if (keyBytes.length !== 16) return null;
-        const cryptoKey = await globalThis.crypto.subtle.importKey(
-            "raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]
-        );
-        const decrypted = await globalThis.crypto.subtle.decrypt(
-            { name: "AES-CBC", iv: ivBytes }, cryptoKey, cipherBytes
-        );
+        const cryptoKey = await globalThis.crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
+        const decrypted = await globalThis.crypto.subtle.decrypt({ name: "AES-CBC", iv: ivBytes }, cryptoKey, cipherBytes);
         return new TextDecoder("utf-8", { fatal: true }).decode(decrypted);
-    } catch {
-        return null;
-    }
+    } catch { return null; }
 }
 
 function isEncryptedString(value) {
@@ -265,96 +225,70 @@ const TOKEN_STORE = {
         { "userId": "587914", "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjU4NzkxNCIsInRpbWVzdGFtcCI6MTc4MTUzMzc3OCwiaXZfdmVyIjoyLCJzZXNzaW9uIjoiZXlKMGVYQWlPaUpLVjFRaUxDSmhiR2NpT2lKSVV6STFOaUo5LmV5SnBaQ0k2SWpVNE56a3hOQ0lzSW1WdFlXbHNJam9pWVd0b2FXeGxjMmg1WVdSaGRqVXlORFEwUUdkdFlXbHNMbU52YlNJc0ltNWhiV1VpT2lKQlMwaEpURVZUU0NCTFZVMUJVaUJaUVVSQlZpSXNJblJsYm1GdWRGUjVjR1VpT2lKMWMyVnlJaXdpZEdWdVlXNTBUbUZ0WlNJNkluTmhZMmhwYm1GallXUmxiWGxmWkdJaUxDSjBaVzVoYm5SSlpDSTZJaUlzSW1ScGMzQnZjMkZpYkdVaU9tWmhiSE5sZlEudnlKQ1FtMmpRRXdycmx5SVF5cUFvbkI4emlHMWhBeG9oNzVvbS1qdHFOWSJ9.N7FfiUQBVM_5fHNprRzcGD87VlE1BvTLk9uquX7kY-o", "batch_id": "323", "batch_name": "BIHAR TRE 4.0 PRT COMPLETE BATCH", "batch_image": "https://appx-content-v2.classx.co.in/paid_course3/2026-09-07-0.009894269282128887.png" },
         { "userId": "512314", "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjUxMjMxNCIsInRpbWVzdGFtcCI6MTc4MDI3ODgxMiwiaXZfdmVyIjoxOSwic2Vzc2lvbiI6ImV5SjBlWEFpT2lKS1YxUWlMQ0poYkdjaU9pSklVekkxTmlKOS5leUpwWkNJNklqVXhNak14TkNJc0ltVnRZV2xzSWpvaWMyaHBkbk5vWVc1cllYSjVZV1JoZGpVMk1rQm5iV0ZwYkM1amIyMGlMQ0p1WVcxbElqb2ljMmhwZG5Ob1lXNXJZWElnZVdGa1lYWWlMQ0owWlc1aGJuUlVlWEJsSWpvaWRYTmxjaUlzSW5SbGJtRnVkRTVoYldVaU9pSnpZV05vYVc1aFkyRmtaVzE1WDJSaUlpd2lkR1Z1WVc1MFNXUWlPaUlpTENKa2FYTndiM05oWW14bElqcG1ZV3h6WlgwLkpmYVFjUm9FWGFGNXJhLUpXNENIRWdnRnk4WEJwYmtQNmdKdGJIcXE2b0EifQ.P1ziwRM5dveL-juW_qRSZNrzq5UThKa-r9hLU5edgIA", "batch_id": "179", "batch_name": "BPSC TRE 4.0 (6th TO 8th) COMPLETE BATCH (LANGUAGE + G.S + ENGLISH)✅", "batch_image": "https://appx-content-v2.classx.co.in/paid_course3/2025-12-21-0.6872761799484489.png" },
         { "userId": "512314", "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjUxMjMxNCIsInRpbWVzdGFtcCI6MTc4MDI3ODgxMiwiaXZfdmVyIjoxOSwic2Vzc2lvbiI6ImV5SjBlWEFpT2lKS1YxUWlMQ0poYkdjaU9pSklVekkxTmlKOS5leUpwWkNJNklqVXhNak14TkNJc0ltVnRZV2xzSWpvaWMyaHBkbk5vWVc1cllYSjVZV1JoZGpVMk1rQm5iV0ZwYkM1amIyMGlMQ0p1WVcxbElqb2ljMmhwZG5Ob1lXNXJZWElnZVdGa1lYWWlMQ0owWlc1aGJuUlVlWEJsSWpvaWRYTmxjaUlzSW5SbGJtRnVkRTVoYldVaU9pSnpZV05vYVc1aFkyRmtaVzE1WDJSaUlpd2lkR1Z1WVc1MFNXUWlPaUlpTENKa2FYTndiM05oWW14bElqcG1ZV3h6WlgwLkpmYVFjUm9FWGFGNXJhLUpXNENIRWdnRnk4WEJwYmtQNmdKdGJIcXE2b0EifQ.P1ziwRM5dveL-juW_qRSZNrzq5UThKa-r9hLU5edgIA", "batch_id": "319", "batch_name": "BIHAR TRE 4.0 (6th TO 8th) COMPLETE BATCH (LANGUAGE + G.S + ENGLISH)", "batch_image": "https://appx-content-v2.classx.co.in/paid_course3/2026-09-07-0.8661632685465565.png" },
-        { "userId": "512314", "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjUxMjMxNCIsInRpbWVzdGFtcCI6MTc4MDI3ODgxMiwiaXZfdmVyIjoxOSwic2Vzc2lvbiI6ImV5SjBlWEFpT2lKS1YxUWlMQ0poYkdjaU9pSklVekkxTmlKOS5leUpwWkNJNklqVXhNak14TkNJc0ltVnRZV2xzSWpvaWMyaHBkbk5vWVc1cllYSjVZV1JoZGpVMk1rQm5iV0ZwYkM1amIyMGlMQ0p1WVcxbElqb2ljMmhwZG5Ob1lXNXJZWElnZVdGa1lYWWlMQ0owWlc1aGJuUlVlWEJsSWpvaWRYTmxjaUlzSW5SbGJtRnVkRTVoYldVaU9pSnpZV05vYVc1aFkyRmtaVzE1WDJSaUlpd2lkR1Z1WVc1MFNXUWlPaUlpTENKa2FYTndiM05oWW14bElqcG1ZV3h6WlgwLkpmYVFjUm9FWGFGNXJhLUpXNENIRWdnRnk4WEJwYmtQNmdKdGJIcXE2b0EifQ.P1ziwRM5dveL-juW_qRSZNrzq5UThKa-r9hLU5edgIA", "batch_id": "361", "batch_name": "JHARKHAND TET PAPER - 2 COURSE", "batch_image": "https://appx-content-v2.classx.co.in/paid_course3/2026-09-07-0.18984778730489593.png" }
+        { "userId": "512314", "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjUxMjMxNCIsInRpbWVzdGFtcCI6MTc4MDI3ODgxMiwiaXZfdmVyIjoxOSwic2Vzc2lvbiI6ImV5SjBlWEFpT2lKS1YxUWlMQ0poYkdjaU9pSklVekkxTmlKOS5leUpwWkNJNklqVXhNak14TkNJc0ltVnRZV2xzSWpvaWMyaHBkbk5vWVc1cllYSjVZV1JoZGpVMk1rQm5iV0ZwYkM1amIyMGlMQ0p1WVcxbElqb2ljMmhwZG5Ob1lXNXJZWElnZVdGa1lYWWlMQ0owWlc1aGJuUlVlWEJsSWpvaWRYTmxjaUlzSW5SbGJtRnVkRTVoYldVaU9pSnpZV05vYVc1aFkyRmtaVzE1WDJSaUlpd2lkR1Z1WVc1MFNXUWlPaUlpTENKa2FYTndiM05oWW14bElqcG1ZV3h6WlgwLkpmYVFjUm9FWGFGNXJhLUpXNENIRWdnRnk4WEJwYmtQNmdKdGJIcXE2b0EifQ.P1ziwRM5dveL-juW_qRSZNrzq5UThKa-r9hLU5edgIA", "batch_id": "361", "batch_name": "JHARKHAND TET PAPER - 2 COURSE", "batch_image": "https://appx-content-v2.classx.co.in/paid_course3/2026-09-07-0.18984778730489593.jpg" }
     ]
 };
 
 // ============================================================================
-// ANTI-429 FETCH WRAPPER
+// ANTI-429 FETCH
 // ============================================================================
 
 async function fetchWithRetry(url, options = {}, timeout = PAGE_TIMEOUT, retries = UPSTREAM_RETRIES) {
     const host = new URL(url).host;
+    const isMedia = /\.(ts|m4s|mp4|aac|m3u8|mpd|key)(\?|$)/i.test(url);
 
-    // Respect host cooldown
-    const cooldown = hostIsCoolingDown(host);
-    if (cooldown > 0) {
-        await sleep(Math.min(cooldown, 5000));
+    if (!isMedia) {
+        const cooldown = hostIsCoolingDown(host);
+        if (cooldown > 0) await sleep(Math.min(cooldown, 5000));
     }
 
-    return upstreamLimiter.run(async () => {
+    const run = async () => {
         let attempt = 0;
         let lastError = null;
 
         while (attempt <= retries) {
-            const controller = new NodeAbortController();
+            const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), timeout);
 
             try {
-                // Small jitter to spread out burst requests
                 if (attempt > 0) await sleep(jitter());
 
-                const response = await fetch(url, {
-                    ...options,
-                    signal: controller.signal,
-                    headers: {
-                        ...(options.headers || {}),
-                        "Connection": "keep-alive",
-                        "Accept-Encoding": "gzip, deflate, br"
-                    }
-                });
-
+                const response = await fetch(url, { ...options, signal: controller.signal });
                 clearTimeout(timer);
 
-                // Success
-                if (response.ok) return response;
+                if (response.ok || response.status === 206 || response.status === 304) return response;
 
-                // 429 / 5xx → retry with backoff
                 if (response.status === 429 || response.status >= 500) {
-                    if (response.status === 429) {
-                        setHostCooldown(host, RATE_LIMIT_COOLDOWN_MS);
-                    }
+                    if (response.status === 429 && !isMedia) setHostCooldown(host, RATE_LIMIT_COOLDOWN_MS);
                     lastError = new Error(`Upstream ${response.status} on ${host}`);
-                    const delay = Math.min(
-                        UPSTREAM_BASE_DELAY * Math.pow(2, attempt) + jitter(400),
-                        UPSTREAM_MAX_DELAY
-                    );
-                    console.warn(`[429-retry] ${host} attempt ${attempt + 1}/${retries + 1} in ${delay}ms`);
+                    const delay = Math.min(UPSTREAM_BASE_DELAY * Math.pow(2, attempt) + jitter(400), UPSTREAM_MAX_DELAY);
+                    console.warn(`[retry] ${response.status} ${host} attempt ${attempt + 1}/${retries + 1} in ${delay}ms`);
                     await sleep(delay);
                     attempt++;
                     continue;
                 }
 
-                // Other 4xx → don't retry
                 return response;
             } catch (err) {
                 clearTimeout(timer);
                 lastError = err;
                 if (attempt >= retries) break;
-                const delay = Math.min(
-                    UPSTREAM_BASE_DELAY * Math.pow(2, attempt) + jitter(400),
-                    UPSTREAM_MAX_DELAY
-                );
+                const delay = Math.min(UPSTREAM_BASE_DELAY * Math.pow(2, attempt) + jitter(400), UPSTREAM_MAX_DELAY);
                 await sleep(delay);
                 attempt++;
             }
         }
-
         throw lastError || new Error("Upstream failed after retries");
-    });
-}
+    };
 
-// ============================================================================
-// COALESCED FETCH (deduplicates identical concurrent requests)
-// ============================================================================
+    if (isMedia) return run();
+    return upstreamLimiter.run(run);
+}
 
 async function coalescedFetch(cacheKey, fetcher) {
     const cached = cacheGet(cacheKey);
     if (cached) return cached;
-
-    if (inflightRequests.has(cacheKey)) {
-        return inflightRequests.get(cacheKey);
-    }
+    if (inflightRequests.has(cacheKey)) return inflightRequests.get(cacheKey);
 
     const promise = (async () => {
         try {
@@ -393,13 +327,7 @@ function findMatchingBatch(tokenData, courseId) {
     return null;
 }
 
-async function fetchTokens() {
-    return TOKEN_STORE;
-}
-
-// ============================================================================
-// GENERIC UPSTREAM FETCHER (with retry + coalescing)
-// ============================================================================
+async function fetchTokens() { return TOKEN_STORE; }
 
 async function upstreamFetchJson(apiUrl, account, extraHeaders = {}) {
     const cacheKey = `json:${apiUrl}`;
@@ -418,10 +346,7 @@ async function upstreamFetchJson(apiUrl, account, extraHeaders = {}) {
                 ...extraHeaders
             }
         }, PAGE_TIMEOUT);
-
-        if (!response.ok) {
-            throw new Error(`Upstream HTTP ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`Upstream HTTP ${response.status}`);
         return await response.json();
     });
 }
@@ -430,7 +355,6 @@ async function upstreamFetchJson(apiUrl, account, extraHeaders = {}) {
 // ROUTES
 // ============================================================================
 
-// Health check
 app.get("/", (req, res) => {
     res.json({ status: 200, message: "StudyBee API Server is running.", time: new Date().toISOString() });
 });
@@ -453,21 +377,15 @@ app.get("/health", (req, res) => {
 app.get(["/api/subjects", "/sex/api/subjects"], async (req, res) => {
     try {
         const courseId = getParam(req, "id");
-        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", message: "Use /api/subjects?id=COURSE_ID", data: [] }, 400);
-
+        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
         const tokenResponse = await fetchTokens();
         const account = findMatchingBatch(tokenResponse.data, courseId);
         if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
-
         const url = new URL(SUBJECT_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("start", "-1");
-
         const json = await upstreamFetchJson(url.toString(), account);
-        return jsonResponse(res, {
-            status: 200, courseId,
-            data: Array.isArray(json.data) ? json.data : (json.data ?? [])
-        });
+        return jsonResponse(res, { status: 200, courseId, data: Array.isArray(json.data) ? json.data : (json.data ?? []) });
     } catch (error) {
         return jsonResponse(res, { status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
@@ -480,21 +398,15 @@ app.get(["/api/topics", "/sex/api/topics"], async (req, res) => {
         const subjectId = getParam(req, "subjectid");
         if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
         if (!subjectId) return jsonResponse(res, { status: 400, error: "Missing subject ID.", courseId, data: [] }, 400);
-
         const tokenResponse = await fetchTokens();
         const account = findMatchingBatch(tokenResponse.data, courseId);
         if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, subjectId, data: [] }, 404);
-
         const url = new URL(TOPICS_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("subjectid", subjectId);
         url.searchParams.set("start", "-1");
-
         const json = await upstreamFetchJson(url.toString(), account);
-        return jsonResponse(res, {
-            status: 200, courseId, subjectId,
-            data: Array.isArray(json.data) ? json.data : (json.data ?? [])
-        });
+        return jsonResponse(res, { status: 200, courseId, subjectId, data: Array.isArray(json.data) ? json.data : (json.data ?? []) });
     } catch (error) {
         return jsonResponse(res, { status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
@@ -507,14 +419,11 @@ app.get(["/api/classes", "/sex/api/classes"], async (req, res) => {
         const subjectId = getParam(req, "subjectid");
         const conceptId = getParam(req, "conceptid");
         const topicId = getParam(req, "topicid", DEFAULT_TOPIC_ID) || DEFAULT_TOPIC_ID;
-
         if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
         if (!subjectId) return jsonResponse(res, { status: 400, error: "Missing subject ID.", courseId, data: [] }, 400);
-
         const tokenResponse = await fetchTokens();
         const account = findMatchingBatch(tokenResponse.data, courseId);
         if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, subjectId, data: [] }, 404);
-
         const url = new URL(CLASSES_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("subjectid", subjectId);
@@ -522,13 +431,9 @@ app.get(["/api/classes", "/sex/api/classes"], async (req, res) => {
         url.searchParams.set("conceptid", conceptId);
         url.searchParams.set("windowsapp", "false");
         url.searchParams.set("start", "0");
-
         const json = await upstreamFetchJson(url.toString(), account);
         const decoded = await decryptObject(json);
-        return jsonResponse(res, {
-            status: 200, courseId, subjectId, topicId, conceptId,
-            data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? [])
-        });
+        return jsonResponse(res, { status: 200, courseId, subjectId, topicId, conceptId, data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? []) });
     } catch (error) {
         return jsonResponse(res, { status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
@@ -542,24 +447,18 @@ app.get(["/api/video", "/sex/api/video"], async (req, res) => {
         const ytFlag = getParam(req, "ytflag", "0");
         if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
         if (!videoId) return jsonResponse(res, { status: 400, error: "Missing video ID.", courseId, data: [] }, 400);
-
         const tokenResponse = await fetchTokens();
         const account = findMatchingBatch(tokenResponse.data, courseId);
         if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, videoId, data: [] }, 404);
-
         const url = new URL(VIDEO_API);
         url.searchParams.set("course_id", courseId);
         url.searchParams.set("video_id", videoId);
         url.searchParams.set("ytflag", ytFlag);
         url.searchParams.set("folder_wise_course", "0");
         url.searchParams.set("lc_app_api_url", "");
-
         const json = await upstreamFetchJson(url.toString(), account);
         const decoded = await decryptObject(json);
-        return jsonResponse(res, {
-            status: 200, courseId, videoId, ytflag: ytFlag,
-            data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? [])
-        });
+        return jsonResponse(res, { status: 200, courseId, videoId, ytflag: ytFlag, data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? []) });
     } catch (error) {
         return jsonResponse(res, { status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
@@ -570,21 +469,15 @@ app.get(["/api/live", "/sex/api/live"], async (req, res) => {
     try {
         const courseId = getParam(req, "id");
         if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
-
         const tokenResponse = await fetchTokens();
         const account = findMatchingBatch(tokenResponse.data, courseId);
         if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
-
         const url = new URL(LIVE_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("start", "-1");
-
         const json = await upstreamFetchJson(url.toString(), account);
         const decoded = await decryptObject(json);
-        return jsonResponse(res, {
-            status: 200, courseId,
-            data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? [])
-        });
+        return jsonResponse(res, { status: 200, courseId, data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? []) });
     } catch (error) {
         return jsonResponse(res, { status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
@@ -595,17 +488,14 @@ app.get(["/api/previous_live", "/sex/api/previous_live"], async (req, res) => {
     try {
         const courseId = getParam(req, "id") || getParam(req, "course_id");
         if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
-
         const tokenResponse = await fetchTokens();
         const account = findMatchingBatch(tokenResponse.data, courseId);
         if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
-
         const url = new URL(PREVIOUS_LIVE_API);
         url.searchParams.set("course_id", courseId);
         url.searchParams.set("start", "0");
         url.searchParams.set("folder_wise_course", "0");
         url.searchParams.set("userid", account.userId);
-
         const json = await upstreamFetchJson(url.toString(), account);
         const decoded = await decryptObject(json);
         return jsonResponse(res, decoded);
@@ -624,7 +514,6 @@ app.get(["/api/fetch_active", "/sex/api/fetch_active"], async (req, res) => {
     try {
         const tokenData = TOKEN_STORE;
         const list = Array.isArray(tokenData.data) ? tokenData.data : [];
-
         const accounts = [];
         const seenPairs = new Set();
         for (const item of list) {
@@ -635,7 +524,6 @@ app.get(["/api/fetch_active", "/sex/api/fetch_active"], async (req, res) => {
             const userId = String(rawUserId).trim();
             const token = String(rawToken).trim();
             if (!userId || !token) continue;
-            if (token.includes("#SYNC_ACCOUNT#")) continue;
             const key = `${userId}\u0000${token}`;
             if (seenPairs.has(key)) continue;
             seenPairs.add(key);
@@ -645,17 +533,13 @@ app.get(["/api/fetch_active", "/sex/api/fetch_active"], async (req, res) => {
         const totalAccounts = accounts.length;
         const totalPages = Math.ceil(totalAccounts / PAGE_SIZE);
         if (page > totalPages) {
-            return jsonResponse(res, {
-                status: 200, message: "No more pages.", page, pageSize: PAGE_SIZE,
-                totalPages, hasNextPage: false, nextUrl: null, data: []
-            });
+            return jsonResponse(res, { status: 200, message: "No more pages.", page, pageSize: PAGE_SIZE, totalPages, hasNextPage: false, nextUrl: null, data: [] });
         }
 
         const startIndex = (page - 1) * PAGE_SIZE;
         const endIndex = Math.min(startIndex + PAGE_SIZE, totalAccounts);
         const pageAccounts = accounts.slice(startIndex, endIndex);
 
-        // Process accounts sequentially (with retry protection inside)
         const results = [];
         for (const account of pageAccounts) {
             const apiUrl = `${COURSE_API}?userid=${encodeURIComponent(account.userId)}`;
@@ -666,20 +550,15 @@ app.get(["/api/fetch_active", "/sex/api/fetch_active"], async (req, res) => {
                     "user-agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36",
                     "device-type": "is-safari 0"
                 });
-                if (json && Array.isArray(json.data)) {
-                    results.push({ success: true, userId: account.userId, token: account.token, courses: json.data });
-                } else {
-                    results.push({ success: false, userId: account.userId, token: account.token, courses: [], error: "Invalid data[]" });
-                }
+                if (json && Array.isArray(json.data)) results.push({ success: true, userId: account.userId, token: account.token, courses: json.data });
+                else results.push({ success: false, userId: account.userId, token: account.token, courses: [], error: "Invalid data[]" });
             } catch (err) {
                 results.push({ success: false, userId: account.userId, token: account.token, courses: [], error: err.message });
             }
         }
 
         const courseMap = new Map();
-        let activeAccounts = 0;
-        let failedAccounts = 0;
-        let totalCoursesBeforeDedup = 0;
+        let activeAccounts = 0, failedAccounts = 0, totalCoursesBeforeDedup = 0;
 
         for (const result of results) {
             if (!result.success) { failedAccounts++; continue; }
@@ -700,25 +579,17 @@ app.get(["/api/fetch_active", "/sex/api/fetch_active"], async (req, res) => {
             }
         }
 
-        const built = {
-            courses: Array.from(courseMap.values()),
-            activeAccounts, failedAccounts, totalCoursesBeforeDedup
-        };
-
+        const built = { courses: Array.from(courseMap.values()), activeAccounts, failedAccounts, totalCoursesBeforeDedup };
         const hasNextPage = page < totalPages;
-        const nextUrl = hasNextPage
-            ? `${requestUrl.origin}/api/fetch_active?page=${page + 1}`
-            : null;
+        const nextUrl = hasNextPage ? `${requestUrl.origin}/api/fetch_active?page=${page + 1}` : null;
 
         return jsonResponse(res, {
             status: 200, page, pageSize: PAGE_SIZE, totalPages, hasNextPage, nextUrl,
             pagination: { page, pageSize: PAGE_SIZE, totalPages, hasNextPage, nextUrl },
             stats: {
-                rawEntries: list.length,
-                validEntries: accounts.length,
+                rawEntries: list.length, validEntries: accounts.length,
                 duplicatesRemoved: list.length - accounts.length,
-                activeAccounts: built.activeAccounts,
-                failedAccounts: built.failedAccounts,
+                activeAccounts: built.activeAccounts, failedAccounts: built.failedAccounts,
                 totalCoursesBeforeDedup: built.totalCoursesBeforeDedup,
                 uniqueCourses: built.courses.length
             },
@@ -741,26 +612,16 @@ app.get(["/api/active", "/sex/api/active"], async (req, res) => {
         const visitedUrls = new Set();
         const pages = [];
         const errors = [];
-
-        let totalPagesFetched = 0;
-        let totalBatchesReceived = 0;
-        let duplicateBatchesRemoved = 0;
-
+        let totalPagesFetched = 0, totalBatchesReceived = 0, duplicateBatchesRemoved = 0;
         let nextUrl = `http://${req.headers.host}/api/fetch_active?page=1`;
 
         while (nextUrl && totalPagesFetched < MAX_PAGES) {
-            if (visitedUrls.has(nextUrl)) {
-                errors.push({ url: nextUrl, error: "Pagination loop detected." });
-                break;
-            }
+            if (visitedUrls.has(nextUrl)) { errors.push({ url: nextUrl, error: "Pagination loop detected." }); break; }
             visitedUrls.add(nextUrl);
 
             let json;
             try {
-                const response = await fetchWithRetry(nextUrl, {
-                    method: "GET",
-                    headers: { "Accept": "application/json" }
-                }, PAGE_TIMEOUT);
+                const response = await fetchWithRetry(nextUrl, { method: "GET", headers: { "Accept": "application/json" } }, PAGE_TIMEOUT);
                 if (!response.ok) throw new Error(`fetch_active HTTP ${response.status}`);
                 json = await response.json();
                 if (!json || typeof json !== "object") throw new Error("Invalid fetch_active response.");
@@ -786,52 +647,28 @@ app.get(["/api/active", "/sex/api/active"], async (req, res) => {
                 if (course.id === undefined || course.id === null) continue;
                 const id = String(course.id).trim();
                 if (!id) continue;
-
                 const batchName = course.batch_name ?? course.course_name ?? course.title ?? course.name ?? "Course Batch";
                 const batchImage = course.batch_image ?? course.course_thumbnail ?? course.thumbnail ?? course.cover ?? course.image ?? course.banner ?? course.batch_thumbnail ?? "";
-
                 if (batchMap.has(id)) { pageDuplicates++; continue; }
-                batchMap.set(id, {
-                    userId, token,
-                    batch_id: id,
-                    batch_name: String(batchName || "Course Batch"),
-                    batch_image: String(batchImage || "")
-                });
+                batchMap.set(id, { userId, token, batch_id: id, batch_name: String(batchName || "Course Batch"), batch_image: String(batchImage || "") });
             }
 
             duplicateBatchesRemoved += pageDuplicates;
-            pages.push({
-                page: json.pagination?.page ?? totalPagesFetched,
-                batchesReceived: courses.length,
-                uniqueBatchesAfterPage: batchMap.size,
-                duplicatesFound: pageDuplicates
-            });
+            pages.push({ page: json.pagination?.page ?? totalPagesFetched, batchesReceived: courses.length, uniqueBatchesAfterPage: batchMap.size, duplicatesFound: pageDuplicates });
 
             const candidateNextUrl = json.pagination?.nextUrl || json.nextUrl || null;
             if (candidateNextUrl) {
                 try { nextUrl = new URL(candidateNextUrl, `http://${req.headers.host}`).toString(); }
                 catch { errors.push({ url: candidateNextUrl, error: "Invalid nextUrl." }); break; }
-            } else {
-                nextUrl = null;
-            }
+            } else nextUrl = null;
         }
 
         const data = Array.from(batchMap.values());
         return jsonResponse(res, {
             status: 200,
             message: `Fetched ${data.length} unique batches from ${totalPagesFetched} pages.`,
-            pagination: {
-                pagesFetched: totalPagesFetched,
-                maxPages: MAX_PAGES,
-                complete: !nextUrl,
-                stoppedByMaxPages: Boolean(nextUrl && totalPagesFetched >= MAX_PAGES),
-                remainingNextUrl: nextUrl || null
-            },
-            stats: {
-                batchesReceivedAcrossPages: totalBatchesReceived,
-                uniqueBatches: data.length,
-                duplicateBatchesRemoved
-            },
+            pagination: { pagesFetched: totalPagesFetched, maxPages: MAX_PAGES, complete: !nextUrl, stoppedByMaxPages: Boolean(nextUrl && totalPagesFetched >= MAX_PAGES), remainingNextUrl: nextUrl || null },
+            stats: { batchesReceivedAcrossPages: totalBatchesReceived, uniqueBatches: data.length, duplicateBatchesRemoved },
             pages, errors, data
         });
     } catch (error) {
@@ -843,10 +680,7 @@ app.get(["/api/active", "/sex/api/active"], async (req, res) => {
 app.get(["/api/batches", "/sex/api/batches"], async (req, res) => {
     try {
         const activeUrl = `http://${req.headers.host}/api/active?key=${ACTIVE_KEY}`;
-        const response = await fetchWithRetry(activeUrl, {
-            method: "GET",
-            headers: { "Accept": "application/json" }
-        }, PAGE_TIMEOUT);
+        const response = await fetchWithRetry(activeUrl, { method: "GET", headers: { "Accept": "application/json" } }, PAGE_TIMEOUT);
         if (!response.ok) throw new Error(`active HTTP ${response.status}`);
         const json = await response.json();
         const sourceData = Array.isArray(json.data) ? json.data : [];
@@ -860,136 +694,206 @@ app.get(["/api/batches", "/sex/api/batches"], async (req, res) => {
             if (!id || batchMap.has(id)) continue;
             const rawName = item.batch_name ?? item.course_name ?? item.title ?? item.name ?? "Course Batch";
             const rawImage = item.batch_image ?? item.course_thumbnail ?? item.thumbnail ?? item.cover ?? item.image ?? item.banner ?? item.batch_thumbnail ?? "";
-            batchMap.set(id, {
-                id,
-                batch_name: String(rawName || "Course Batch"),
-                batch_image: String(rawImage || "")
-            });
+            batchMap.set(id, { id, batch_name: String(rawName || "Course Batch"), batch_image: String(rawImage || "") });
         }
 
         const data = Array.from(batchMap.values());
-        return jsonResponse(res, {
-            status: 200,
-            message: `Fetched ${data.length} unique batches.`,
-            count: data.length,
-            data
-        });
+        return jsonResponse(res, { status: 200, message: `Fetched ${data.length} unique batches.`, count: data.length, data });
     } catch (error) {
         return jsonResponse(res, { status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
 });
 
-// ---------- /api/player (stream proxy) ----------
+// ============================================================================
+// /api/player — STREAM PROXY (FIXED)
+// ============================================================================
+
 app.all(["/api/player", "/sex/api/player"], async (req, res) => {
     if (req.method === "OPTIONS") {
         return res.status(204).set(PLAYER_HEADERS).end();
     }
 
-    const streamUrlParam = req.query.url;
+    // ---------- Extract + unwrap the target URL ----------
+    const targetUrl = extractTargetUrl(req);
 
-    if (streamUrlParam) {
+    // ---------- If no valid URL → reverse proxy the Akamai portal ----------
+    if (!targetUrl) {
+        const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+        const host = req.headers["x-forwarded-host"] || req.headers.host;
+        const incoming = new URL(req.originalUrl, `${proto}://${host}`);
+        const targetPath = incoming.pathname === "/" ? "/combined-img-player" : incoming.pathname;
+        const destinationUrl = new URL(targetPath + incoming.search, TARGET_ORIGIN).href;
+
         try {
-            const targetUrl = new URL(streamUrlParam);
-            const modifiedHeaders = {
-                "Host": targetUrl.host,
-                "Origin": TARGET_ORIGIN,
-                "Referer": TARGET_ORIGIN + "/",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-            };
-
-            // Forward Range header for MP4 seeking
-            if (req.headers.range) {
-                modifiedHeaders["Range"] = req.headers.range;
-            }
-
-            const response = await fetchWithRetry(targetUrl.href, {
+            const upstream = await fetchWithRetry(destinationUrl, {
                 method: req.method,
-                headers: modifiedHeaders,
+                headers: {
+                    "Host": new URL(TARGET_ORIGIN).host,
+                    "Origin": TARGET_ORIGIN,
+                    "Referer": TARGET_ORIGIN + "/",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                },
                 redirect: "follow"
             }, 30000, 3);
 
-            const newHeaders = {};
-            response.headers.forEach((value, key) => {
-                newHeaders[key] = value;
-            });
-            newHeaders["Access-Control-Allow-Origin"] = "*";
-            newHeaders["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges, Content-Type";
-
-            const contentType = response.headers.get("content-type") || "";
-
-            // HLS manifest rewriting
-            if (contentType.includes("mpegurl") || contentType.includes("application/x-mpegurl") || targetUrl.pathname.endsWith(".m3u8")) {
-                let responseText = await response.text();
-                const proto = req.protocol || "https";
-                const host = req.headers.host;
-                const basePath = req.baseUrl || "/api/player";
-
-                const rewrittenLines = responseText.split('\n').map(line => {
-                    const trimmed = line.trim();
-                    if (!trimmed) return line;
-
-                    if (trimmed.startsWith('#')) {
-                        return line.replace(/URI="([^"]+)"/g, (match, p1) => {
-                            const absoluteUri = p1.startsWith('http') ? p1 : new URL(p1, targetUrl.href).href;
-                            return `URI="${proto}://${host}${basePath}?url=${encodeURIComponent(absoluteUri)}"`;
-                        });
-                    }
-
-                    const absoluteUri = trimmed.startsWith('http') ? trimmed : new URL(trimmed, targetUrl.href).href;
-                    return `${proto}://${host}${basePath}?url=${encodeURIComponent(absoluteUri)}`;
-                });
-
-                return res.status(response.status).set(newHeaders).send(rewrittenLines.join('\n'));
+            const contentType = upstream.headers.get("content-type") || "";
+            if (contentType.includes("text/html") || contentType.includes("javascript")) {
+                let text = await upstream.text();
+                text = text.split(TARGET_ORIGIN).join(`${proto}://${host}`);
+                res.setHeader("Content-Type", contentType);
+                res.setHeader("Access-Control-Allow-Origin", "*");
+                return res.status(upstream.status).send(text);
             }
 
-            // Stream binary (MP4, TS chunks, etc.)
-            res.status(response.status).set(newHeaders);
-            response.body.pipe(res);
-            return;
+            if (upstream.headers.get("content-type")) res.setHeader("Content-Type", upstream.headers.get("content-type"));
+            if (upstream.headers.get("content-length")) res.setHeader("Content-Length", upstream.headers.get("content-length"));
+            res.setHeader("Access-Control-Allow-Origin", "*");
+            res.status(upstream.status);
+            if (req.method === "HEAD" || !upstream.body) return res.end();
+            const stream = Readable.fromWeb(upstream.body);
+            stream.on("error", () => res.destroy());
+            return stream.pipe(res);
         } catch (err) {
-            return res.status(500).set(PLAYER_HEADERS).send(`Stream Engine Error: ${err.message}`);
+            return res.status(500).set(PLAYER_HEADERS).send(`Portal Proxy Failure: ${err.message}`);
         }
     }
 
-    // Reverse proxy for assets
-    const proto = req.protocol || "https";
-    const host = req.headers.host;
-    const incoming = new URL(req.originalUrl, `${proto}://${host}`);
-    let targetPath = incoming.pathname === "/" ? "/combined-img-player" : incoming.pathname;
-    const destinationUrl = new URL(targetPath + incoming.search, TARGET_ORIGIN).href;
-
+    // ---------- STREAM MODE ----------
     try {
-        const proxyHeaders = {
-            "Host": new URL(TARGET_ORIGIN).host,
+        const upstreamHeaders = {
+            "Host": targetUrl.host,
             "Origin": TARGET_ORIGIN,
             "Referer": TARGET_ORIGIN + "/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9"
         };
 
-        const response = await fetchWithRetry(destinationUrl, {
-            method: req.method,
-            headers: proxyHeaders,
+        // Forward Range header for MP4 seeking
+        if (req.headers.range) upstreamHeaders["Range"] = req.headers.range;
+        if (req.headers["if-range"]) upstreamHeaders["If-Range"] = req.headers["if-range"];
+        if (req.headers["if-none-match"]) upstreamHeaders["If-None-Match"] = req.headers["if-none-match"];
+        if (req.headers["if-modified-since"]) upstreamHeaders["If-Modified-Since"] = req.headers["if-modified-since"];
+
+        const upstream = await fetchWithRetry(targetUrl.href, {
+            method: req.method === "HEAD" ? "HEAD" : "GET",
+            headers: upstreamHeaders,
             redirect: "follow"
-        }, 30000, 3);
+        }, 30000, 4);
 
-        const finalHeaders = {};
-        response.headers.forEach((value, key) => { finalHeaders[key] = value; });
-        finalHeaders["Access-Control-Allow-Origin"] = "*";
+        // Pass through headers (case-insensitive)
+        const passHeaders = ["content-type", "content-length", "content-encoding", "cache-control", "etag", "last-modified", "accept-ranges", "content-range", "vary", "expires"];
+        for (const key of passHeaders) {
+            const v = upstream.headers.get(key);
+            if (v) res.setHeader(key, v);
+        }
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+        if (!upstream.headers.get("accept-ranges")) res.setHeader("Accept-Ranges", "bytes");
 
-        const contentType = response.headers.get("content-type") || "";
+        const contentType = (upstream.headers.get("content-type") || "").toLowerCase();
 
-        if (contentType.includes("text/html") || contentType.includes("javascript")) {
-            let textContent = await response.text();
-            textContent = textContent.split(TARGET_ORIGIN).join(`${proto}://${host}`);
-            return res.status(response.status).set(finalHeaders).send(textContent);
+        // ---------- HLS manifest rewriting ----------
+        if (contentType.includes("mpegurl") || contentType.includes("application/x-mpegurl") || contentType.includes("vnd.apple.mpegurl") || targetUrl.pathname.toLowerCase().endsWith(".m3u8")) {
+            const manifest = await upstream.text();
+            const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+            const host = req.headers["x-forwarded-host"] || req.headers.host;
+            const basePath = "/api/player";
+
+            const rewritten = manifest.split("\n").map((line) => {
+                const trimmed = line.trim();
+                if (!trimmed) return line;
+
+                if (trimmed.startsWith("#")) {
+                    return line.replace(/URI="([^"]+)"/g, (_, p1) => {
+                        let abs;
+                        try { abs = new URL(p1, targetUrl.href).href; }
+                        catch { return `URI="${p1}"`; }
+                        return `URI="${proto}://${host}${basePath}?url=${encodeURIComponent(abs)}"`;
+                    });
+                }
+
+                let abs;
+                try { abs = new URL(trimmed, targetUrl.href).href; }
+                catch { return line; }
+                return `${proto}://${host}${basePath}?url=${encodeURIComponent(abs)}`;
+            });
+
+            res.removeHeader("content-length");
+            res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+            res.setHeader("Cache-Control", "no-cache");
+            return res.status(upstream.status).send(rewritten.join("\n"));
         }
 
-        res.status(response.status).set(finalHeaders);
-        response.body.pipe(res);
+        // ---------- Binary passthrough (MP4, TS, etc.) ----------
+        res.status(upstream.status);
+        if (req.method === "HEAD" || !upstream.body) return res.end();
+
+        const nodeStream = Readable.fromWeb(upstream.body);
+        nodeStream.on("error", (err) => {
+            console.error("[stream] body error:", err.message);
+            if (!res.headersSent) res.status(502).end();
+            else res.destroy();
+        });
+        req.on("close", () => {
+            if (!nodeStream.destroyed) nodeStream.destroy();
+        });
+        nodeStream.pipe(res);
     } catch (err) {
-        return res.status(500).set(PLAYER_HEADERS).send(`Portal Proxy Failure: ${err.message}`);
+        console.error("[stream] error:", err.message);
+        if (!res.headersSent) return res.status(502).set(PLAYER_HEADERS).send(`Stream Engine Error: ${err.message}`);
+        return res.end();
     }
 });
+
+// ----------------------------------------------------------------------------
+// URL EXTRACTOR — handles nested / double-encoded cases
+// ----------------------------------------------------------------------------
+function extractTargetUrl(req) {
+    let candidate = req.query.url;
+    if (!candidate) return null;
+    candidate = String(candidate).trim();
+
+    for (let i = 0; i < 6; i++) {
+        // Try decoding once more (handles double-encoding)
+        try {
+            const decoded = decodeURIComponent(candidate);
+            if (decoded !== candidate) candidate = decoded;
+        } catch { /* not encoded */ }
+
+        // If candidate is our own URL with a nested ?url=, unwrap
+        if (candidate.startsWith("http://") || candidate.startsWith("https://") || candidate.startsWith("/")) {
+            try {
+                const parsed = new URL(candidate, `http://${req.headers.host}`);
+                // Only unwrap if it points to our own /api/player endpoint
+                if (parsed.pathname.endsWith("/api/player") || parsed.pathname.endsWith("/sex/api/player")) {
+                    const inner = parsed.searchParams.get("url");
+                    if (inner && inner !== candidate) {
+                        candidate = inner;
+                        continue;
+                    }
+                }
+                // Otherwise if it's a valid external URL, return it
+                if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+                    // Only return if host is not our own
+                    if (parsed.host !== req.headers.host) return parsed;
+                }
+            } catch { /* fall through */ }
+        }
+
+        // Direct parse attempt
+        try {
+            const direct = new URL(candidate);
+            if (direct.protocol === "http:" || direct.protocol === "https:") return direct;
+        } catch { /* keep looping */ }
+
+        // Try protocol-relative
+        if (candidate.startsWith("//")) {
+            try { return new URL("https:" + candidate); } catch { /* keep looping */ }
+        }
+    }
+    return null;
+}
 
 // ---------- /private.json ----------
 app.get(["/private.json", "/sex/private.json"], (req, res) => {
@@ -1016,50 +920,30 @@ app.use((req, res) => {
     jsonResponse(res, { status: 404, message: "Not found", data: [] }, 404);
 });
 
-// ============================================================================
-// GLOBAL ERROR HANDLER
-// ============================================================================
-
+// ---------- Global error handler ----------
 app.use((err, req, res, next) => {
     console.error("Unhandled error:", err);
     if (res.headersSent) return next(err);
     jsonResponse(res, { status: 500, error: err.message || "Internal Server Error", data: [] }, 500);
 });
 
-// ============================================================================
-// PERIODIC CACHE CLEANUP
-// ============================================================================
-
+// ---------- Cache cleanup ----------
 setInterval(() => {
     const now = Date.now();
     let removed = 0;
     for (const [key, entry] of responseCache.entries()) {
-        if (now > entry.expiry) {
-            responseCache.delete(key);
-            removed++;
-        }
+        if (now > entry.expiry) { responseCache.delete(key); removed++; }
     }
     if (removed > 0) console.log(`[cache] Cleaned ${removed} expired entries.`);
 }, 60_000);
 
-// ============================================================================
-// START SERVER
-// ============================================================================
-
+// ---------- Start ----------
 app.listen(PORT, () => {
     console.log(`✅ StudyBee API Server listening on port ${PORT}`);
     console.log(`   Upstream concurrency: ${UPSTREAM_CONCURRENCY}`);
     console.log(`   Retries per request: ${UPSTREAM_RETRIES}`);
     console.log(`   Cache TTL: ${CACHE_TTL_MS}ms`);
-    console.log(`   Host cooldown on 429: ${RATE_LIMIT_COOLDOWN_MS}ms`);
 });
 
-// Graceful shutdown
-process.on("SIGTERM", () => {
-    console.log("SIGTERM received, shutting down gracefully...");
-    process.exit(0);
-});
-process.on("SIGINT", () => {
-    console.log("SIGINT received, shutting down gracefully...");
-    process.exit(0);
-});
+process.on("SIGTERM", () => { console.log("SIGTERM received"); process.exit(0); });
+process.on("SIGINT", () => { console.log("SIGINT received"); process.exit(0); });
