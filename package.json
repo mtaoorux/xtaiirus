@@ -1,7 +1,6 @@
 {
   "name": "studybee-api",
   "version": "1.0.0",
-  "description": "StudyBee API for Render",
   "main": "server.js",
   "type": "module",
   "scripts": {
