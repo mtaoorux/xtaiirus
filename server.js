@@ -1,15 +1,21 @@
 // ============================================================================
-// STUDYBEE API SERVER — RENDER (FULLY WORKING STREAM PROXY)
+// STUDYBEE — SINGLE FILE SERVER
+// FILE: functions/[[path]].js
+//
+// Routes:
+//   GET  /api/subjects?id=
+//   GET  /api/topics?id=&subjectid=
+//   GET  /api/classes?id=&subjectid=&topicid=
+//   GET  /api/video?id=&videoid=
+//   GET  /api/live?id=
+//   GET  /api/previous_live?id=
+//   GET  /api/fetch_active?page=
+//   GET  /api/active?key=shivuu
+//   GET  /api/batches
+//   GET  /api/player?url=          ← stream proxy
+//   GET  /private.json
+//   GET  /tokens.json              ← blocked
 // ============================================================================
-
-import express from "express";
-import cors from "cors";
-import { Readable } from "node:stream";
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(cors({ origin: "*" }));
 
 // ============================================================================
 // CONSTANTS
@@ -27,15 +33,8 @@ const DECRYPTION_KEY = "638udh3829162018";
 const DEFAULT_TOPIC_ID = "1";
 
 const MAX_PAGES = 20;
-const PAGE_TIMEOUT = 15000;
 const PAGE_SIZE = 40;
-const UPSTREAM_CONCURRENCY = 4;
-const UPSTREAM_RETRIES = 4;
-const UPSTREAM_BASE_DELAY = 700;
-const UPSTREAM_MAX_DELAY = 12000;
-const CACHE_TTL_MS = 60_000;
-const RATE_LIMIT_COOLDOWN_MS = 30_000;
-const REQUEST_JITTER_MS = 150;
+const PROXY_PATH = "/api/player";
 
 const ADMIN_KEYS = new Set(["shivuu", "adii"]);
 const ACTIVE_KEY = "shivuu";
@@ -56,138 +55,6 @@ const STREAM_HEADERS = {
     "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
     "Access-Control-Max-Age": "86400"
 };
-
-// ============================================================================
-// SIMPLE IN-MEMORY CACHE
-// ============================================================================
-
-const responseCache = new Map();
-const inflightRequests = new Map();
-
-function cacheGet(key) {
-    const entry = responseCache.get(key);
-    if (!entry) return null;
-    if (Date.now() > entry.expiry) { responseCache.delete(key); return null; }
-    return entry.data;
-}
-
-function cacheSet(key, data, ttl = CACHE_TTL_MS) {
-    if (responseCache.size > 500) {
-        const firstKey = responseCache.keys().next().value;
-        responseCache.delete(firstKey);
-    }
-    responseCache.set(key, { data, expiry: Date.now() + ttl });
-}
-
-// ============================================================================
-// HOST COOLDOWN (anti-429)
-// ============================================================================
-
-const hostCooldowns = new Map();
-
-function hostCooldownRemaining(host) {
-    const until = hostCooldowns.get(host);
-    if (!until) return 0;
-    const remaining = until - Date.now();
-    if (remaining <= 0) { hostCooldowns.delete(host); return 0; }
-    return remaining;
-}
-
-function setHostCooldown(host, ms = RATE_LIMIT_COOLDOWN_MS) {
-    hostCooldowns.set(host, Date.now() + ms);
-}
-
-// ============================================================================
-// CONCURRENCY LIMITER
-// ============================================================================
-
-class ConcurrencyLimiter {
-    constructor(max) { this.max = max; this.active = 0; this.queue = []; }
-    async run(fn) {
-        if (this.active >= this.max) await new Promise(r => this.queue.push(r));
-        this.active++;
-        try { return await fn(); }
-        finally {
-            this.active--;
-            const next = this.queue.shift();
-            if (next) next();
-        }
-    }
-}
-
-const upstreamLimiter = new ConcurrencyLimiter(UPSTREAM_CONCURRENCY);
-
-// ============================================================================
-// UTILS
-// ============================================================================
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const jitter = (ms = REQUEST_JITTER_MS) => Math.floor(Math.random() * ms);
-
-function jsonResponse(res, payload, status = 200) {
-    res.status(status).set(JSON_HEADERS).send(JSON.stringify(payload, null, 4));
-}
-
-function getParam(req, name, def = "") {
-    const v = req.query[name];
-    if (v === null || v === undefined) return def;
-    return String(v).trim();
-}
-
-function base64ToUint8Array(base64) {
-    try {
-        if (typeof base64 !== "string") return null;
-        let n = base64.replace(/-/g, "+").replace(/_/g, "/");
-        while (n.length % 4 !== 0) n += "=";
-        const bin = Buffer.from(n, "base64").toString("binary");
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        return bytes;
-    } catch { return null; }
-}
-
-async function decrypt(enc) {
-    try {
-        if (typeof enc !== "string") return null;
-        const [cipher, iv] = enc.split(":");
-        if (!cipher || !iv) return null;
-        const cb = base64ToUint8Array(cipher);
-        const ib = base64ToUint8Array(iv);
-        if (!cb || !ib || ib.length !== 16) return null;
-        const kb = new TextEncoder().encode(DECRYPTION_KEY);
-        if (kb.length !== 16) return null;
-        const k = await globalThis.crypto.subtle.importKey("raw", kb, { name: "AES-CBC" }, false, ["decrypt"]);
-        const d = await globalThis.crypto.subtle.decrypt({ name: "AES-CBC", iv: ib }, k, cb);
-        return new TextDecoder("utf-8", { fatal: true }).decode(d);
-    } catch { return null; }
-}
-
-function isEncryptedString(v) {
-    if (typeof v !== "string") return false;
-    const [c, i] = v.split(":");
-    if (!c || !i) return false;
-    const ib = base64ToUint8Array(i);
-    return !!(ib && ib.length === 16);
-}
-
-async function decryptObject(value) {
-    if (typeof value === "string") {
-        if (!isEncryptedString(value)) return value;
-        const d = await decrypt(value);
-        return d === null ? value : d;
-    }
-    if (Array.isArray(value)) {
-        const out = [];
-        for (const item of value) out.push(await decryptObject(item));
-        return out;
-    }
-    if (value !== null && typeof value === "object") {
-        const out = {};
-        for (const [k, v] of Object.entries(value)) out[k] = await decryptObject(v);
-        return out;
-    }
-    return value;
-}
 
 // ============================================================================
 // TOKEN STORE
@@ -225,181 +92,211 @@ const TOKEN_STORE = {
 };
 
 // ============================================================================
-// FETCH WITH RETRY
+// MAIN ROUTER
 // ============================================================================
 
-async function fetchWithRetry(url, options = {}, timeout = PAGE_TIMEOUT, retries = UPSTREAM_RETRIES) {
-    const host = new URL(url).host;
-    const isMedia = /\.(ts|m4s|mp4|aac|m3u8|mpd|key)(\?|$)/i.test(url);
+export async function onRequest(context) {
+    const { request } = context;
+    const url = new URL(request.url);
+    const pathname = url.pathname;
 
-    if (!isMedia) {
-        const cd = hostCooldownRemaining(host);
-        if (cd > 0) await sleep(Math.min(cd, 5000));
+    if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: STREAM_HEADERS });
     }
 
-    const run = async () => {
-        let attempt = 0;
-        let lastError = null;
-        while (attempt <= retries) {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), timeout);
-            try {
-                if (attempt > 0) await sleep(jitter());
-                const response = await fetch(url, { ...options, signal: controller.signal });
-                clearTimeout(timer);
-                if (response.ok || response.status === 206 || response.status === 304) return response;
-                if (response.status === 429 || response.status >= 500) {
-                    if (response.status === 429 && !isMedia) setHostCooldown(host);
-                    lastError = new Error(`Upstream ${response.status} on ${host}`);
-                    const delay = Math.min(UPSTREAM_BASE_DELAY * Math.pow(2, attempt) + jitter(400), UPSTREAM_MAX_DELAY);
-                    await sleep(delay);
-                    attempt++;
-                    continue;
-                }
-                return response;
-            } catch (err) {
-                clearTimeout(timer);
-                lastError = err;
-                if (attempt >= retries) break;
-                const delay = Math.min(UPSTREAM_BASE_DELAY * Math.pow(2, attempt) + jitter(400), UPSTREAM_MAX_DELAY);
-                await sleep(delay);
-                attempt++;
+    if (pathname.includes("/_private") || pathname.includes("/_lib")) {
+        return jsonResponse({ status: 404, message: "Not found", data: [] }, 404);
+    }
+
+    if (pathname === "/api/player" || pathname === "/sex/api/player") return handlePlayer(request, url);
+    if (pathname === "/api/subjects" || pathname === "/sex/api/subjects") return handleSubjects(request);
+    if (pathname === "/api/topics" || pathname === "/sex/api/topics") return handleTopics(request);
+    if (pathname === "/api/classes" || pathname === "/sex/api/classes") return handleClasses(request);
+    if (pathname === "/api/video" || pathname === "/sex/api/video") return handleVideo(request);
+    if (pathname === "/api/live" || pathname === "/sex/api/live") return handleLive(request);
+    if (pathname === "/api/previous_live" || pathname === "/sex/api/previous_live") return handlePreviousLive(request);
+    if (pathname === "/api/fetch_active" || pathname === "/sex/api/fetch_active") return handleFetchActive(request);
+    if (pathname === "/api/active" || pathname === "/sex/api/active") return handleActive(request);
+    if (pathname === "/api/batches" || pathname === "/sex/api/batches") return handleBatches(request);
+
+    if (pathname === "/private.json" || pathname === "/sex/private.json") {
+        return new Response(JSON.stringify(TOKEN_STORE), {
+            status: 200,
+            headers: {
+                "Content-Type": "application/json; charset=UTF-8",
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Access-Control-Allow-Origin": "*"
             }
-        }
-        throw lastError || new Error("Upstream failed");
-    };
+        });
+    }
 
-    if (isMedia) return run();
-    return upstreamLimiter.run(run);
-}
+    if (pathname === "/tokens.json" || pathname === "/sex/tokens.json") {
+        return jsonResponse({ status: 404, message: "Not found", data: [] }, 404);
+    }
 
-async function coalescedFetch(key, fetcher) {
-    const cached = cacheGet(key);
-    if (cached) return cached;
-    if (inflightRequests.has(key)) return inflightRequests.get(key);
-    const p = (async () => {
-        try {
-            const data = await fetcher();
-            cacheSet(key, data);
-            return data;
-        } finally { inflightRequests.delete(key); }
-    })();
-    inflightRequests.set(key, p);
-    return p;
+    return jsonResponse({ status: 404, message: "Not found", data: [] }, 404);
 }
 
 // ============================================================================
 // HELPERS
 // ============================================================================
 
-function findMatchingBatch(list, courseId) {
-    const wanted = String(courseId).trim();
-    for (const item of list) {
+function jsonResponse(payload, status = 200) {
+    return new Response(JSON.stringify(payload, null, 4), { status, headers: JSON_HEADERS });
+}
+
+function getParam(request, name, defaultValue = "") {
+    const url = new URL(request.url);
+    const value = url.searchParams.get(name);
+    if (value === null || value === undefined) return defaultValue;
+    return String(value).trim();
+}
+
+function findMatchingBatch(tokenData, courseId) {
+    const wantedId = String(courseId).trim();
+    for (const item of tokenData) {
         if (!item || typeof item !== "object") continue;
-        const rawId = item.batch_id ?? item.batchId ?? item.id;
-        if (rawId === undefined || rawId === null) continue;
-        if (String(rawId).trim() !== wanted) continue;
-        const rawU = item.userId ?? item.user_id;
-        const rawT = item.token ?? item.authorization;
-        if (rawU == null || rawT == null) return null;
-        const userId = String(rawU).trim();
-        const token = String(rawT).trim();
+        const rawBatchId = item.batch_id ?? item.batchId ?? item.id;
+        if (rawBatchId === undefined || rawBatchId === null) continue;
+        const batchId = String(rawBatchId).trim();
+        if (batchId !== wantedId) continue;
+        const rawUserId = item.userId ?? item.user_id;
+        const rawToken = item.token ?? item.authorization;
+        if (rawUserId === undefined || rawUserId === null || rawToken === undefined || rawToken === null) return null;
+        const userId = String(rawUserId).trim();
+        const token = String(rawToken).trim();
         if (!userId || !token) return null;
-        return { userId, token, batchId: wanted };
+        return { userId, token, batchId };
     }
     return null;
 }
 
-async function upstreamFetchJson(apiUrl, account, extra = {}) {
-    return coalescedFetch(`json:${apiUrl}`, async () => {
-        const r = await fetchWithRetry(apiUrl, {
-            method: "GET",
-            headers: {
-                "Accept": "*/*",
-                "Auth-Key": "appxapi",
-                "Authorization": account.token,
-                "Client-Service": "Appx",
-                "Device-Type": "",
-                "Is-Safari": "0",
-                "Source": "website",
-                "User-Id": account.userId,
-                ...extra
-            }
-        }, PAGE_TIMEOUT);
-        if (!r.ok) throw new Error(`Upstream HTTP ${r.status}`);
-        return await r.json();
-    });
+function base64ToUint8Array(base64) {
+    try {
+        if (typeof base64 !== "string") return null;
+        let normalized = base64.replace(/-/g, "+").replace(/_/g, "/");
+        while (normalized.length % 4 !== 0) normalized += "=";
+        const binary = atob(normalized);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    } catch { return null; }
+}
+
+async function decrypt(enc) {
+    try {
+        if (typeof enc !== "string") return null;
+        const parts = enc.split(":");
+        if (parts.length !== 2) return null;
+        const [cipher, iv] = parts;
+        if (!cipher || !iv) return null;
+        const cipherBytes = base64ToUint8Array(cipher);
+        const ivBytes = base64ToUint8Array(iv);
+        if (!cipherBytes || !ivBytes || ivBytes.length !== 16) return null;
+        const keyBytes = new TextEncoder().encode(DECRYPTION_KEY);
+        if (keyBytes.length !== 16) return null;
+        const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
+        const decrypted = await crypto.subtle.decrypt({ name: "AES-CBC", iv: ivBytes }, cryptoKey, cipherBytes);
+        return new TextDecoder("utf-8", { fatal: true }).decode(decrypted);
+    } catch { return null; }
+}
+
+function isEncryptedString(value) {
+    if (typeof value !== "string") return false;
+    const parts = value.split(":");
+    if (parts.length !== 2) return false;
+    const [cipher, iv] = parts;
+    if (!cipher || !iv) return false;
+    const ivBytes = base64ToUint8Array(iv);
+    return !!(ivBytes && ivBytes.length === 16);
+}
+
+async function decryptObject(value) {
+    if (typeof value === "string") {
+        if (!isEncryptedString(value)) return value;
+        const decrypted = await decrypt(value);
+        return decrypted === null ? value : decrypted;
+    }
+    if (Array.isArray(value)) {
+        const output = [];
+        for (const item of value) output.push(await decryptObject(item));
+        return output;
+    }
+    if (value !== null && typeof value === "object") {
+        const output = {};
+        for (const [key, item] of Object.entries(value)) output[key] = await decryptObject(item);
+        return output;
+    }
+    return value;
+}
+
+function buildUpstreamHeaders(account) {
+    return {
+        "Accept": "*/*",
+        "Auth-Key": "appxapi",
+        "Authorization": account.token,
+        "Client-Service": "Appx",
+        "Device-Type": "",
+        "Is-Safari": "0",
+        "Source": "website",
+        "User-Id": account.userId
+    };
 }
 
 // ============================================================================
-// ROOT ROUTES
+// ROUTE HANDLERS
 // ============================================================================
 
-app.get("/", (req, res) => {
-    res.json({ status: 200, message: "StudyBee API running", time: new Date().toISOString() });
-});
-
-app.get("/health", (req, res) => {
-    res.json({
-        status: 200,
-        uptime: process.uptime(),
-        cacheSize: responseCache.size,
-        inflight: inflightRequests.size,
-        activeUpstream: upstreamLimiter.active,
-        queued: upstreamLimiter.queue.length,
-        cooldowns: Array.from(hostCooldowns.entries()).map(([h, u]) => ({ host: h, remainingMs: Math.max(0, u - Date.now()) }))
-    });
-});
-
-// ============================================================================
-// API ROUTES
-// ============================================================================
-
-app.get(["/api/subjects", "/sex/api/subjects"], async (req, res) => {
+async function handleSubjects(request) {
     try {
-        const courseId = getParam(req, "id");
-        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
+        const courseId = getParam(request, "id");
+        if (!courseId) return jsonResponse({ status: 400, error: "Missing course ID.", data: [] }, 400);
         const account = findMatchingBatch(TOKEN_STORE.data, courseId);
-        if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
+        if (!account) return jsonResponse({ status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
         const url = new URL(SUBJECT_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("start", "-1");
-        const json = await upstreamFetchJson(url.toString(), account);
-        return jsonResponse(res, { status: 200, courseId, data: Array.isArray(json.data) ? json.data : (json.data ?? []) });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+        const response = await fetch(url.toString(), { method: "GET", headers: buildUpstreamHeaders(account), cache: "no-store" });
+        if (!response.ok) throw new Error(`Subject API returned HTTP ${response.status}`);
+        const json = await response.json();
+        return jsonResponse({ status: 200, courseId, data: Array.isArray(json.data) ? json.data : (json.data ?? []) });
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/topics", "/sex/api/topics"], async (req, res) => {
+async function handleTopics(request) {
     try {
-        const courseId = getParam(req, "id");
-        const subjectId = getParam(req, "subjectid");
-        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
-        if (!subjectId) return jsonResponse(res, { status: 400, error: "Missing subject ID.", courseId, data: [] }, 400);
+        const courseId = getParam(request, "id");
+        const subjectId = getParam(request, "subjectid");
+        if (!courseId) return jsonResponse({ status: 400, error: "Missing course ID.", data: [] }, 400);
+        if (!subjectId) return jsonResponse({ status: 400, error: "Missing subject ID.", courseId, data: [] }, 400);
         const account = findMatchingBatch(TOKEN_STORE.data, courseId);
-        if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, subjectId, data: [] }, 404);
+        if (!account) return jsonResponse({ status: 404, error: "No matching batch found.", courseId, subjectId, data: [] }, 404);
         const url = new URL(TOPICS_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("subjectid", subjectId);
         url.searchParams.set("start", "-1");
-        const json = await upstreamFetchJson(url.toString(), account);
-        return jsonResponse(res, { status: 200, courseId, subjectId, data: Array.isArray(json.data) ? json.data : (json.data ?? []) });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+        const response = await fetch(url.toString(), { method: "GET", headers: buildUpstreamHeaders(account), cache: "no-store" });
+        if (!response.ok) throw new Error(`Topics API returned HTTP ${response.status}`);
+        const json = await response.json();
+        return jsonResponse({ status: 200, courseId, subjectId, data: Array.isArray(json.data) ? json.data : (json.data ?? []) });
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/classes", "/sex/api/classes"], async (req, res) => {
+async function handleClasses(request) {
     try {
-        const courseId = getParam(req, "id");
-        const subjectId = getParam(req, "subjectid");
-        const conceptId = getParam(req, "conceptid");
-        const topicId = getParam(req, "topicid", DEFAULT_TOPIC_ID) || DEFAULT_TOPIC_ID;
-        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
-        if (!subjectId) return jsonResponse(res, { status: 400, error: "Missing subject ID.", courseId, data: [] }, 400);
+        const courseId = getParam(request, "id");
+        const subjectId = getParam(request, "subjectid");
+        const conceptId = getParam(request, "conceptid");
+        const topicId = getParam(request, "topicid", DEFAULT_TOPIC_ID) || DEFAULT_TOPIC_ID;
+        if (!courseId) return jsonResponse({ status: 400, error: "Missing course ID.", data: [] }, 400);
+        if (!subjectId) return jsonResponse({ status: 400, error: "Missing subject ID.", courseId, data: [] }, 400);
         const account = findMatchingBatch(TOKEN_STORE.data, courseId);
-        if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, subjectId, data: [] }, 404);
+        if (!account) return jsonResponse({ status: 404, error: "No matching batch found.", courseId, subjectId, data: [] }, 404);
         const url = new URL(CLASSES_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("subjectid", subjectId);
@@ -407,552 +304,470 @@ app.get(["/api/classes", "/sex/api/classes"], async (req, res) => {
         url.searchParams.set("conceptid", conceptId);
         url.searchParams.set("windowsapp", "false");
         url.searchParams.set("start", "0");
-        const json = await upstreamFetchJson(url.toString(), account);
-        const dec = await decryptObject(json);
-        return jsonResponse(res, { status: 200, courseId, subjectId, topicId, conceptId, data: Array.isArray(dec.data) ? dec.data : (dec.data ?? []) });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+        const response = await fetch(url.toString(), { method: "GET", headers: buildUpstreamHeaders(account), cache: "no-store" });
+        if (!response.ok) throw new Error(`Classes API returned HTTP ${response.status}`);
+        const json = await response.json();
+        const decoded = await decryptObject(json);
+        return jsonResponse({ status: 200, courseId, subjectId, topicId, conceptId, data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? []) });
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/video", "/sex/api/video"], async (req, res) => {
+async function handleVideo(request) {
     try {
-        const courseId = getParam(req, "id");
-        const videoId = getParam(req, "videoid");
-        const ytFlag = getParam(req, "ytflag", "0");
-        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
-        if (!videoId) return jsonResponse(res, { status: 400, error: "Missing video ID.", courseId, data: [] }, 400);
+        const courseId = getParam(request, "id");
+        const videoId = getParam(request, "videoid");
+        const ytFlag = getParam(request, "ytflag", "0");
+        if (!courseId) return jsonResponse({ status: 400, error: "Missing course ID.", data: [] }, 400);
+        if (!videoId) return jsonResponse({ status: 400, error: "Missing video ID.", courseId, data: [] }, 400);
         const account = findMatchingBatch(TOKEN_STORE.data, courseId);
-        if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, videoId, data: [] }, 404);
+        if (!account) return jsonResponse({ status: 404, error: "No matching batch found.", courseId, videoId, data: [] }, 404);
         const url = new URL(VIDEO_API);
         url.searchParams.set("course_id", courseId);
         url.searchParams.set("video_id", videoId);
         url.searchParams.set("ytflag", ytFlag);
         url.searchParams.set("folder_wise_course", "0");
         url.searchParams.set("lc_app_api_url", "");
-        const json = await upstreamFetchJson(url.toString(), account);
-        const dec = await decryptObject(json);
-        return jsonResponse(res, { status: 200, courseId, videoId, ytflag: ytFlag, data: Array.isArray(dec.data) ? dec.data : (dec.data ?? []) });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+        const response = await fetch(url.toString(), { method: "GET", headers: buildUpstreamHeaders(account), cache: "no-store" });
+        if (!response.ok) throw new Error(`Video API returned HTTP ${response.status}`);
+        const json = await response.json();
+        const decoded = await decryptObject(json);
+        return jsonResponse({ status: 200, courseId, videoId, ytflag: ytFlag, data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? []) });
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/live", "/sex/api/live"], async (req, res) => {
+async function handleLive(request) {
     try {
-        const courseId = getParam(req, "id");
-        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
+        const courseId = getParam(request, "id");
+        if (!courseId) return jsonResponse({ status: 400, error: "Missing course ID.", data: [] }, 400);
         const account = findMatchingBatch(TOKEN_STORE.data, courseId);
-        if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
+        if (!account) return jsonResponse({ status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
         const url = new URL(LIVE_API);
         url.searchParams.set("courseid", courseId);
         url.searchParams.set("start", "-1");
-        const json = await upstreamFetchJson(url.toString(), account);
-        const dec = await decryptObject(json);
-        return jsonResponse(res, { status: 200, courseId, data: Array.isArray(dec.data) ? dec.data : (dec.data ?? []) });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+        const response = await fetch(url.toString(), { method: "GET", headers: buildUpstreamHeaders(account), cache: "no-store" });
+        if (!response.ok) throw new Error(`Live API returned HTTP ${response.status}`);
+        const json = await response.json();
+        const decoded = await decryptObject(json);
+        return jsonResponse({ status: 200, courseId, data: Array.isArray(decoded.data) ? decoded.data : (decoded.data ?? []) });
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/previous_live", "/sex/api/previous_live"], async (req, res) => {
+async function handlePreviousLive(request) {
     try {
-        const courseId = getParam(req, "id") || getParam(req, "course_id");
-        if (!courseId) return jsonResponse(res, { status: 400, error: "Missing course ID.", data: [] }, 400);
+        const courseId = getParam(request, "id") || getParam(request, "course_id");
+        if (!courseId) return jsonResponse({ status: 400, error: "Missing course ID.", data: [] }, 400);
         const account = findMatchingBatch(TOKEN_STORE.data, courseId);
-        if (!account) return jsonResponse(res, { status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
+        if (!account) return jsonResponse({ status: 404, error: "No matching batch found.", courseId, data: [] }, 404);
         const url = new URL(PREVIOUS_LIVE_API);
         url.searchParams.set("course_id", courseId);
         url.searchParams.set("start", "0");
         url.searchParams.set("folder_wise_course", "0");
         url.searchParams.set("userid", account.userId);
-        const json = await upstreamFetchJson(url.toString(), account);
-        const dec = await decryptObject(json);
-        return jsonResponse(res, dec);
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+        const response = await fetch(url.toString(), { method: "GET", headers: buildUpstreamHeaders(account), cache: "no-store" });
+        if (!response.ok) throw new Error(`Previous Live API returned HTTP ${response.status}`);
+        const json = await response.json();
+        const decoded = await decryptObject(json);
+        return jsonResponse(decoded);
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/fetch_active", "/sex/api/fetch_active"], async (req, res) => {
-    const requestUrl = new URL(req.url, `http://${req.headers.host}`);
-    let page = Number(req.query.page || "1");
+async function handleFetchActive(request) {
+    const url = new URL(request.url);
+    let page = Number(url.searchParams.get("page") || "1");
     if (!Number.isFinite(page) || page < 1) page = 1;
     page = Math.floor(page);
 
     try {
         const list = Array.isArray(TOKEN_STORE.data) ? TOKEN_STORE.data : [];
         const accounts = [];
-        const seen = new Set();
+        const seenPairs = new Set();
         for (const item of list) {
             if (!item || typeof item !== "object") continue;
-            const u = item.userId ?? item.user_id;
-            const t = item.token ?? item.authorization;
-            if (u == null || t == null) continue;
-            const userId = String(u).trim();
-            const token = String(t).trim();
+            const rawUserId = item.userId ?? item.user_id;
+            const rawToken = item.token ?? item.authorization;
+            if (rawUserId === undefined || rawToken === undefined) continue;
+            const userId = String(rawUserId).trim();
+            const token = String(rawToken).trim();
             if (!userId || !token) continue;
             const key = `${userId}\u0000${token}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
+            if (seenPairs.has(key)) continue;
+            seenPairs.add(key);
             accounts.push({ userId, token });
         }
 
         const totalAccounts = accounts.length;
         const totalPages = Math.ceil(totalAccounts / PAGE_SIZE);
         if (page > totalPages) {
-            return jsonResponse(res, { status: 200, message: "No more pages.", page, pageSize: PAGE_SIZE, totalPages, hasNextPage: false, nextUrl: null, data: [] });
+            return jsonResponse({ status: 200, message: "No more pages.", page, pageSize: PAGE_SIZE, totalPages, hasNextPage: false, nextUrl: null, data: [] });
         }
 
-        const start = (page - 1) * PAGE_SIZE;
-        const end = Math.min(start + PAGE_SIZE, totalAccounts);
-        const pageAccounts = accounts.slice(start, end);
+        const startIndex = (page - 1) * PAGE_SIZE;
+        const endIndex = Math.min(startIndex + PAGE_SIZE, totalAccounts);
+        const pageAccounts = accounts.slice(startIndex, endIndex);
 
         const results = [];
         for (const account of pageAccounts) {
             const apiUrl = `${COURSE_API}?userid=${encodeURIComponent(account.userId)}`;
             try {
-                const json = await upstreamFetchJson(apiUrl, account, {
-                    "origin": "https://sachinacademy.classx.co.in",
-                    "referer": "https://sachinacademy.classx.co.in/",
-                    "user-agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36",
-                    "device-type": "is-safari 0"
+                const response = await fetch(apiUrl, {
+                    method: "GET",
+                    headers: {
+                        "accept": "*/*",
+                        "auth-key": "appxapi",
+                        "authorization": account.token,
+                        "client-service": "Appx",
+                        "device-type": "is-safari 0",
+                        "origin": "https://sachinacademy.classx.co.in",
+                        "referer": "https://sachinacademy.classx.co.in/",
+                        "source": "website",
+                        "user-agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36",
+                        "user-id": String(account.userId)
+                    },
+                    cache: "no-store"
                 });
-                if (json && Array.isArray(json.data)) results.push({ success: true, userId: account.userId, token: account.token, courses: json.data });
-                else results.push({ success: false, userId: account.userId, token: account.token, courses: [], error: "Invalid data[]" });
+                if (!response.ok) {
+                    results.push({ success: false, userId: account.userId, token: account.token, courses: [], error: `HTTP ${response.status}` });
+                    continue;
+                }
+                const json = await response.json();
+                if (json && Array.isArray(json.data)) {
+                    results.push({ success: true, userId: account.userId, token: account.token, courses: json.data });
+                } else {
+                    results.push({ success: false, userId: account.userId, token: account.token, courses: [], error: "No data[]" });
+                }
             } catch (err) {
                 results.push({ success: false, userId: account.userId, token: account.token, courses: [], error: err.message });
             }
         }
 
         const courseMap = new Map();
-        let activeAccounts = 0, failedAccounts = 0, totalBefore = 0;
-        for (const r of results) {
-            if (!r.success) { failedAccounts++; continue; }
+        let activeAccounts = 0, failedAccounts = 0, totalCoursesBeforeDedup = 0;
+        for (const result of results) {
+            if (!result.success) { failedAccounts++; continue; }
             activeAccounts++;
-            if (!Array.isArray(r.courses)) continue;
-            totalBefore += r.courses.length;
-            for (const c of r.courses) {
-                if (!c || c.id == null) continue;
-                const cid = String(c.id);
-                if (!courseMap.has(cid)) {
-                    courseMap.set(cid, {
-                        id: cid,
-                        course_name: c.course_name || c.title || c.name || "Course Batch",
-                        course_thumbnail: c.course_thumbnail || c.thumbnail || c.cover || "",
-                        account: { userId: r.userId, token: r.token }
+            if (!Array.isArray(result.courses)) continue;
+            totalCoursesBeforeDedup += result.courses.length;
+            for (const course of result.courses) {
+                if (!course || course.id === undefined || course.id === null) continue;
+                const courseId = String(course.id);
+                if (!courseMap.has(courseId)) {
+                    courseMap.set(courseId, {
+                        id: courseId,
+                        course_name: course.course_name || course.title || course.name || "Course Batch",
+                        course_thumbnail: course.course_thumbnail || course.thumbnail || course.cover || "",
+                        account: { userId: result.userId, token: result.token }
                     });
                 }
             }
         }
 
-        const built = { courses: Array.from(courseMap.values()), activeAccounts, failedAccounts, totalCoursesBeforeDedup: totalBefore };
+        const built = { courses: Array.from(courseMap.values()), activeAccounts, failedAccounts, totalCoursesBeforeDedup };
         const hasNextPage = page < totalPages;
-        const nextUrl = hasNextPage ? `${requestUrl.origin}/api/fetch_active?page=${page + 1}` : null;
+        const nextUrl = hasNextPage ? `${url.origin}/api/fetch_active?page=${page + 1}` : null;
 
-        return jsonResponse(res, {
+        return jsonResponse({
             status: 200, page, pageSize: PAGE_SIZE, totalPages, hasNextPage, nextUrl,
             pagination: { page, pageSize: PAGE_SIZE, totalPages, hasNextPage, nextUrl },
             stats: {
-                rawEntries: list.length, validEntries: accounts.length,
+                rawEntries: list.length,
+                validEntries: accounts.length,
                 duplicatesRemoved: list.length - accounts.length,
-                activeAccounts: built.activeAccounts, failedAccounts: built.failedAccounts,
+                activeAccounts: built.activeAccounts,
+                failedAccounts: built.failedAccounts,
                 totalCoursesBeforeDedup: built.totalCoursesBeforeDedup,
                 uniqueCourses: built.courses.length
             },
             data: built.courses
         });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/active", "/sex/api/active"], async (req, res) => {
-    const key = req.query.key;
-    if (!key || !ADMIN_KEYS.has(key)) return jsonResponse(res, { status: 401, error: "Unauthorized Access" }, 401);
+async function handleActive(request) {
+    const url = new URL(request.url);
+    const suppliedKey = url.searchParams.get("key");
+    if (!suppliedKey || !ADMIN_KEYS.has(suppliedKey)) {
+        return jsonResponse({ status: 401, error: "Unauthorized Access" }, 401);
+    }
 
     try {
         const batchMap = new Map();
-        const visited = new Set();
+        const visitedUrls = new Set();
         const pages = [];
         const errors = [];
-        let totalPages = 0, totalReceived = 0, dupes = 0;
-        let nextUrl = `http://${req.headers.host}/api/fetch_active?page=1`;
+        let totalPagesFetched = 0, totalBatchesReceived = 0, duplicateBatchesRemoved = 0;
+        let nextUrl = `${url.origin}/api/fetch_active?page=1`;
 
-        while (nextUrl && totalPages < MAX_PAGES) {
-            if (visited.has(nextUrl)) { errors.push({ url: nextUrl, error: "Loop detected." }); break; }
-            visited.add(nextUrl);
-            let json;
-            try {
-                const r = await fetchWithRetry(nextUrl, { method: "GET", headers: { "Accept": "application/json" } }, PAGE_TIMEOUT);
-                if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                json = await r.json();
-            } catch (e) {
-                errors.push({ url: nextUrl, error: e?.message || "Failed" });
+        while (nextUrl && totalPagesFetched < MAX_PAGES) {
+            if (visitedUrls.has(nextUrl)) {
+                errors.push({ url: nextUrl, error: "Pagination loop detected." });
                 break;
             }
-            totalPages++;
-            const courses = Array.isArray(json.data) ? json.data : [];
-            totalReceived += courses.length;
-            let pageDupes = 0;
-            for (const c of courses) {
-                if (!c || typeof c !== "object") continue;
-                const acc = c.account;
-                if (!acc || typeof acc !== "object") continue;
-                const u = acc.userId ?? acc.user_id;
-                if (u == null) continue;
-                const userId = String(u).trim();
-                if (!userId) continue;
-                const token = acc.token ?? acc.authorization ?? "";
-                if (c.id == null) continue;
-                const id = String(c.id).trim();
-                if (!id) continue;
-                const name = c.batch_name ?? c.course_name ?? c.title ?? c.name ?? "Course Batch";
-                const img = c.batch_image ?? c.course_thumbnail ?? c.thumbnail ?? c.cover ?? c.image ?? c.banner ?? "";
-                if (batchMap.has(id)) { pageDupes++; continue; }
-                batchMap.set(id, { userId, token, batch_id: id, batch_name: String(name), batch_image: String(img || "") });
+            visitedUrls.add(nextUrl);
+
+            let json;
+            try {
+                const response = await fetch(nextUrl, { method: "GET", headers: { "Accept": "application/json" }, cache: "no-store" });
+                if (!response.ok) throw new Error(`fetch_active HTTP ${response.status}`);
+                json = await response.json();
+            } catch (error) {
+                errors.push({ url: nextUrl, error: error?.message || "Failed to fetch page." });
+                break;
             }
-            dupes += pageDupes;
-            pages.push({ page: json.pagination?.page ?? totalPages, batchesReceived: courses.length, uniqueBatchesAfterPage: batchMap.size, duplicatesFound: pageDupes });
-            const cand = json.pagination?.nextUrl || json.nextUrl || null;
-            if (cand) {
-                try { nextUrl = new URL(cand, `http://${req.headers.host}`).toString(); }
-                catch { errors.push({ url: cand, error: "Invalid nextUrl" }); break; }
+
+            totalPagesFetched++;
+            const courses = Array.isArray(json.data) ? json.data : [];
+            totalBatchesReceived += courses.length;
+
+            let pageDuplicates = 0;
+            for (const course of courses) {
+                if (!course || typeof course !== "object") continue;
+                const account = course.account;
+                if (!account || typeof account !== "object") continue;
+                const rawUserId = account.userId ?? account.user_id;
+                if (rawUserId === undefined || rawUserId === null) continue;
+                const userId = String(rawUserId).trim();
+                if (!userId) continue;
+                const token = account.token ?? account.authorization ?? "";
+                if (course.id === undefined || course.id === null) continue;
+                const id = String(course.id).trim();
+                if (!id) continue;
+                const batchName = course.batch_name ?? course.course_name ?? course.title ?? course.name ?? "Course Batch";
+                const batchImage = course.batch_image ?? course.course_thumbnail ?? course.thumbnail ?? course.cover ?? course.image ?? course.banner ?? course.batch_thumbnail ?? "";
+                if (batchMap.has(id)) { pageDuplicates++; continue; }
+                batchMap.set(id, { userId, token, batch_id: id, batch_name: String(batchName || "Course Batch"), batch_image: String(batchImage || "") });
+            }
+
+            duplicateBatchesRemoved += pageDuplicates;
+            pages.push({ page: json.pagination?.page ?? totalPagesFetched, batchesReceived: courses.length, uniqueBatchesAfterPage: batchMap.size, duplicatesFound: pageDuplicates });
+
+            const candidateNextUrl = json.pagination?.nextUrl || json.nextUrl || null;
+            if (candidateNextUrl) {
+                try { nextUrl = new URL(candidateNextUrl, url.origin).toString(); }
+                catch { errors.push({ url: candidateNextUrl, error: "Invalid nextUrl." }); break; }
             } else nextUrl = null;
         }
 
         const data = Array.from(batchMap.values());
-        return jsonResponse(res, {
+        return jsonResponse({
             status: 200,
-            message: `Fetched ${data.length} unique batches from ${totalPages} pages.`,
-            pagination: { pagesFetched: totalPages, maxPages: MAX_PAGES, complete: !nextUrl, stoppedByMaxPages: Boolean(nextUrl && totalPages >= MAX_PAGES), remainingNextUrl: nextUrl || null },
-            stats: { batchesReceivedAcrossPages: totalReceived, uniqueBatches: data.length, duplicateBatchesRemoved: dupes },
+            message: `Fetched ${data.length} unique batches from ${totalPagesFetched} pages.`,
+            pagination: {
+                pagesFetched: totalPagesFetched,
+                maxPages: MAX_PAGES,
+                complete: !nextUrl,
+                stoppedByMaxPages: Boolean(nextUrl && totalPagesFetched >= MAX_PAGES),
+                remainingNextUrl: nextUrl || null
+            },
+            stats: { batchesReceivedAcrossPages: totalBatchesReceived, uniqueBatches: data.length, duplicateBatchesRemoved },
             pages, errors, data
         });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error", data: [] }, 500);
     }
-});
+}
 
-app.get(["/api/batches", "/sex/api/batches"], async (req, res) => {
+async function handleBatches(request) {
     try {
-        const url = `http://${req.headers.host}/api/active?key=${ACTIVE_KEY}`;
-        const r = await fetchWithRetry(url, { method: "GET", headers: { "Accept": "application/json" } }, PAGE_TIMEOUT);
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const json = await r.json();
-        const src = Array.isArray(json.data) ? json.data : [];
-        const map = new Map();
-        for (const item of src) {
+        const url = new URL(request.url);
+        const activeUrl = `${url.origin}/api/active?key=${ACTIVE_KEY}`;
+        const response = await fetch(activeUrl, { method: "GET", headers: { "Accept": "application/json" }, cache: "no-store" });
+        if (!response.ok) throw new Error(`active HTTP ${response.status}`);
+        const json = await response.json();
+        const sourceData = Array.isArray(json.data) ? json.data : [];
+
+        const batchMap = new Map();
+        for (const item of sourceData) {
             if (!item || typeof item !== "object") continue;
             const rawId = item.batch_id ?? item.id;
-            if (rawId == null) continue;
+            if (rawId === null || rawId === undefined) continue;
             const id = String(rawId).trim();
-            if (!id || map.has(id)) continue;
-            const name = item.batch_name ?? item.course_name ?? item.title ?? item.name ?? "Course Batch";
-            const img = item.batch_image ?? item.course_thumbnail ?? item.thumbnail ?? item.cover ?? item.image ?? item.banner ?? "";
-            map.set(id, { id, batch_name: String(name), batch_image: String(img || "") });
+            if (!id || batchMap.has(id)) continue;
+            const rawName = item.batch_name ?? item.course_name ?? item.title ?? item.name ?? "Course Batch";
+            const rawImage = item.batch_image ?? item.course_thumbnail ?? item.thumbnail ?? item.cover ?? item.image ?? item.banner ?? item.batch_thumbnail ?? "";
+            batchMap.set(id, { id, batch_name: String(rawName || "Course Batch"), batch_image: String(rawImage || "") });
         }
-        const data = Array.from(map.values());
-        return jsonResponse(res, { status: 200, message: `Fetched ${data.length} batches.`, count: data.length, data });
-    } catch (e) {
-        return jsonResponse(res, { status: 500, error: e?.message || "Server Error", data: [] }, 500);
+
+        const data = Array.from(batchMap.values());
+        return jsonResponse({ status: 200, message: `Fetched ${data.length} unique batches.`, count: data.length, data });
+    } catch (error) {
+        return jsonResponse({ status: 500, error: error?.message || "Internal Server Error.", data: [] }, 500);
     }
-});
+}
 
 // ============================================================================
-// /api/player — FINAL WORKING STREAM PROXY
+// PLAYER — STREAM PROXY
 // ============================================================================
 
-app.all(["/api/player", "/sex/api/player"], async (req, res) => {
-    if (req.method === "OPTIONS") return res.status(204).set(STREAM_HEADERS).end();
+async function handlePlayer(request, url) {
+    const targetUrl = extractTargetUrl(request, url);
 
-    // ── Step 1: Recover the FULL target URL from raw query string ──
-    const targetUrl = recoverTargetUrl(req);
-
-    // ── Step 2: If no target → proxy Akamai portal asset ──
     if (!targetUrl) {
-        return proxyPortalAsset(req, res);
+        return jsonResponse({
+            status: 400,
+            error: "Invalid URL",
+            message: "Could not parse the 'url' query parameter.",
+            received: url.searchParams.get("url") || "(missing)",
+            hint: "Use /api/player?url=" + encodeURIComponent("https://example.com/video.mp4")
+        }, 400);
     }
 
-    // ── Step 3: Build upstream request headers ──
-    const upstreamHeaders = {
-        "Host": targetUrl.host,
-        "Origin": TARGET_ORIGIN,
-        "Referer": TARGET_ORIGIN + "/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity"
-    };
-    if (req.headers.range) upstreamHeaders["Range"] = req.headers.range;
-    if (req.headers["if-range"]) upstreamHeaders["If-Range"] = req.headers["if-range"];
-    if (req.headers["if-none-match"]) upstreamHeaders["If-None-Match"] = req.headers["if-none-match"];
-    if (req.headers["if-modified-since"]) upstreamHeaders["If-Modified-Since"] = req.headers["if-modified-since"];
+    const proxyHeaders = new Headers();
+    proxyHeaders.set("Origin", TARGET_ORIGIN);
+    proxyHeaders.set("Referer", TARGET_ORIGIN + "/");
+    proxyHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
+    proxyHeaders.set("Accept", "*/*");
+    proxyHeaders.set("Accept-Language", "en-US,en;q=0.9");
 
-    let upstream;
+    const range = request.headers.get("range");
+    const ifRange = request.headers.get("if-range");
+    const ifNoneMatch = request.headers.get("if-none-match");
+    const ifModifiedSince = request.headers.get("if-modified-since");
+    if (range) proxyHeaders.set("Range", range);
+    if (ifRange) proxyHeaders.set("If-Range", ifRange);
+    if (ifNoneMatch) proxyHeaders.set("If-None-Match", ifNoneMatch);
+    if (ifModifiedSince) proxyHeaders.set("If-Modified-Since", ifModifiedSince);
+
+    let response;
     try {
-        upstream = await fetchWithRetry(targetUrl.href, {
-            method: req.method === "HEAD" ? "HEAD" : "GET",
-            headers: upstreamHeaders,
+        response = await fetch(targetUrl, {
+            method: request.method === "HEAD" ? "HEAD" : "GET",
+            headers: proxyHeaders,
             redirect: "follow"
-        }, 30000, 4);
-    } catch (e) {
-        console.error("[player] upstream fetch failed:", e.message);
-        return res.status(502).set(STREAM_HEADERS).send(`Upstream fetch failed: ${e.message}`);
+        });
+    } catch (err) {
+        return jsonResponse({ status: 502, error: `Upstream fetch failed: ${err.message}`, data: [] }, 502);
     }
 
-    // ── Step 4: If upstream returned 4xx/5xx, pass through + log ──
-    if (upstream.status >= 400) {
-        console.error(`[player] upstream ${upstream.status} for ${targetUrl.host}${targetUrl.pathname}`);
-        const body = await upstream.text().catch(() => "");
-        const headers = {};
-        upstream.headers.forEach((v, k) => { headers[k] = v; });
-        headers["Access-Control-Allow-Origin"] = "*";
-        return res.status(upstream.status).set(headers).send(body);
-    }
-
-    // ── Step 5: Pass through response headers ──
+    const responseHeaders = new Headers();
     const passthrough = ["content-type", "content-length", "content-encoding", "cache-control", "etag", "last-modified", "accept-ranges", "content-range", "vary", "expires"];
     for (const h of passthrough) {
-        const v = upstream.headers.get(h);
-        if (v) res.setHeader(h, v);
+        const v = response.headers.get(h);
+        if (v) responseHeaders.set(h, v);
     }
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
-    if (!upstream.headers.get("accept-ranges")) res.setHeader("Accept-Ranges", "bytes");
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+    if (!responseHeaders.has("accept-ranges")) responseHeaders.set("Accept-Ranges", "bytes");
 
-    const contentType = (upstream.headers.get("content-type") || "").toLowerCase();
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const lowerTarget = targetUrl.toLowerCase();
     const isM3U8 = contentType.includes("mpegurl")
         || contentType.includes("application/x-mpegurl")
         || contentType.includes("vnd.apple.mpegurl")
-        || targetUrl.pathname.toLowerCase().endsWith(".m3u8")
-        || targetUrl.pathname.toLowerCase().endsWith(".m3u");
+        || lowerTarget.includes(".m3u8")
+        || lowerTarget.includes(".m3u");
 
-    // ── Step 6: HLS manifest rewriting ──
     if (isM3U8) {
         let manifest;
         try {
-            manifest = await upstream.text();
-        } catch (e) {
-            return res.status(502).send(`Manifest read error: ${e.message}`);
+            manifest = await response.text();
+        } catch (err) {
+            return jsonResponse({ status: 502, error: `Manifest read error: ${err.message}`, data: [] }, 502);
         }
 
-        // Sanity check — must start with #EXTM3U (allow BOM)
-        if (!manifest || !manifest.replace(/^\uFEFF/, "").trimStart().startsWith("#EXTM3U")) {
-            console.warn("[player] Not a valid M3U8. First 200 chars:", manifest.slice(0, 200));
-            // Still return it raw if short — might be an error page
-            res.removeHeader("content-length");
-            res.setHeader("Content-Type", "text/plain");
-            return res.status(upstream.status).send(manifest);
+        const clean = manifest.replace(/^\uFEFF/, "").trimStart();
+        if (!clean.startsWith("#EXTM3U")) {
+            responseHeaders.delete("content-length");
+            responseHeaders.set("Content-Type", "text/plain; charset=UTF-8");
+            return new Response(manifest, { status: response.status, headers: responseHeaders });
         }
 
-        const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
-        const host = req.headers["x-forwarded-host"] || req.headers.host;
-        const basePath = "/api/player";
-        const baseForRelative = targetUrl.href.substring(0, targetUrl.href.lastIndexOf("/") + 1);
-
-        const rewritten = manifest.split("\n").map((line) => {
-            const raw = line;
-            const trimmed = line.trim();
-            if (!trimmed) return raw;
-
-            // Rewrite URI="..." attributes inside tags
-            if (trimmed.startsWith("#")) {
-                return raw.replace(/URI="([^"]+)"/g, (_, uri) => {
-                    let abs;
-                    try { abs = new URL(uri, baseForRelative).href; }
-                    catch { return `URI="${uri}"`; }
-                    return `URI="${proto}://${host}${basePath}?url=${encodeURIComponent(abs)}"`;
-                });
-            }
-
-            // Segment / sub-playlist URL
-            let abs;
-            try { abs = new URL(trimmed, baseForRelative).href; }
-            catch { return raw; }
-            return `${proto}://${host}${basePath}?url=${encodeURIComponent(abs)}`;
-        });
-
-        res.removeHeader("content-length");
-        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-cache");
-        return res.status(upstream.status).send(rewritten.join("\n"));
+        const rewritten = rewriteM3U8(manifest, targetUrl, url.origin);
+        responseHeaders.delete("content-length");
+        responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
+        responseHeaders.set("Cache-Control", "no-cache");
+        return new Response(rewritten, { status: response.status, headers: responseHeaders });
     }
 
-    // ── Step 7: Binary passthrough ──
-    res.status(upstream.status);
-
-    if (req.method === "HEAD" || !upstream.body) return res.end();
-
-    const nodeStream = Readable.fromWeb(upstream.body);
-    nodeStream.on("error", (err) => {
-        console.error("[player] stream error:", err.message);
-        if (!res.headersSent) res.status(502).end();
-        else res.destroy();
-    });
-    req.on("close", () => {
-        if (!nodeStream.destroyed) nodeStream.destroy();
-    });
-    nodeStream.pipe(res);
-});
-
-// ----------------------------------------------------------------------------
-// Recover full URL from raw query string (handles & inside the target URL)
-// ----------------------------------------------------------------------------
-function recoverTargetUrl(req) {
-    // req.originalUrl looks like: /api/player?url=https%3A%2F%2F...%3Fedge-cache-token%3D...%26bitrate%3D720&title=...
-    const originalUrl = req.originalUrl || req.url || "";
-    const qIndex = originalUrl.indexOf("?");
-    const rawQuery = qIndex >= 0 ? originalUrl.slice(qIndex + 1) : "";
-
-    let candidate = null;
-
-    if (rawQuery) {
-        // Find url= in raw query
-        const parts = rawQuery.split("&");
-        let collecting = false;
-        const buffer = [];
-        for (const part of parts) {
-            if (!collecting) {
-                if (part.startsWith("url=")) {
-                    collecting = true;
-                    buffer.push(part.slice(4));
-                }
-            } else {
-                // Heuristic: known own params that terminate the url value
-                if (/^(title|t|_t|_|v|ts)=/.test(part)) break;
-                buffer.push(part);
-            }
-        }
-        if (buffer.length) {
-            // Rejoin with & (they were separated by raw & but belong to the target)
-            let joined = buffer.join("&");
-            // Now decode progressively to unwrap nested encodings
-            candidate = joined;
-        }
+    if (request.method === "HEAD" || !response.body) {
+        return new Response(null, { status: response.status, headers: responseHeaders });
     }
 
-    if (!candidate && req.query.url) candidate = String(req.query.url).trim();
+    return new Response(response.body, { status: response.status, headers: responseHeaders });
+}
+
+function rewriteM3U8(manifest, baseUrl, proxyOrigin) {
+    const proxyBase = `${proxyOrigin}${PROXY_PATH}`;
+
+    return manifest.split("\n").map((line) => {
+        const raw = line;
+        const trimmed = line.trim();
+        if (!trimmed) return raw;
+
+        if (trimmed.startsWith("#")) {
+            return raw.replace(/URI="([^"]+)"/g, (_, uri) => {
+                let absolute;
+                try { absolute = new URL(uri, baseUrl).href; }
+                catch { return `URI="${uri}"`; }
+                return `URI="${proxyBase}?url=${encodeURIComponent(absolute)}"`;
+            });
+        }
+
+        let absolute;
+        try { absolute = new URL(trimmed, baseUrl).href; }
+        catch { return raw; }
+
+        if (absolute.startsWith(proxyBase)) return raw;
+        return `${proxyBase}?url=${encodeURIComponent(absolute)}`;
+    }).join("\n");
+}
+
+function extractTargetUrl(request, url) {
+    let candidate = url.searchParams.get("url");
+
+    if (!candidate) {
+        const rawQuery = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+        const idx = rawQuery.indexOf("url=");
+        if (idx !== -1) candidate = rawQuery.slice(idx + 4);
+    }
+
     if (!candidate) return null;
+    candidate = String(candidate).trim();
 
-    // Progressive decode + unwrap
     for (let i = 0; i < 6; i++) {
         const before = candidate;
+
         try {
             const dec = decodeURIComponent(candidate);
             if (dec !== candidate) candidate = dec;
-        } catch { /* ignore */ }
+        } catch { /* not encoded */ }
 
-        // If candidate is a URL pointing to our own /api/player, unwrap
-        try {
-            const parsed = new URL(candidate, `http://${req.headers.host}`);
-            if ((parsed.pathname.endsWith("/api/player") || parsed.pathname.endsWith("/sex/api/player"))) {
-                const inner = parsed.searchParams.get("url");
-                if (inner && inner !== candidate) {
-                    candidate = inner;
-                    continue;
+        if (candidate.startsWith("/") || candidate.startsWith("http://") || candidate.startsWith("https://")) {
+            try {
+                const parsed = new URL(candidate, url.origin);
+                if (parsed.pathname === PROXY_PATH) {
+                    const inner = parsed.searchParams.get("url");
+                    if (inner && inner !== candidate) {
+                        candidate = inner;
+                        continue;
+                    }
                 }
-            }
-            if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host !== req.headers.host) {
-                return parsed;
-            }
-        } catch { /* fall through */ }
+                if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host !== url.host) {
+                    return parsed.href;
+                }
+            } catch { /* fall through */ }
+        }
 
-        // Direct parse
         try {
             const direct = new URL(candidate);
-            if (direct.protocol === "http:" || direct.protocol === "https:") return direct;
+            if (direct.protocol === "http:" || direct.protocol === "https:") return direct.href;
         } catch { /* keep looping */ }
 
         if (candidate.startsWith("//")) {
-            try { return new URL("https:" + candidate); } catch { /* keep looping */ }
+            try { return new URL("https:" + candidate).href; } catch { /* keep looping */ }
         }
 
-        if (before === candidate) break; // no progress → stop
+        if (before === candidate) break;
     }
 
     return null;
 }
-
-// ----------------------------------------------------------------------------
-// Proxy Akamai portal asset (when no ?url= target is provided)
-// ----------------------------------------------------------------------------
-async function proxyPortalAsset(req, res) {
-    const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
-    const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const incoming = new URL(req.originalUrl, `${proto}://${host}`);
-    const targetPath = incoming.pathname === "/" ? "/combined-img-player" : incoming.pathname;
-    const destinationUrl = new URL(targetPath + incoming.search, TARGET_ORIGIN).href;
-
-    try {
-        const r = await fetchWithRetry(destinationUrl, {
-            method: req.method,
-            headers: {
-                "Host": new URL(TARGET_ORIGIN).host,
-                "Origin": TARGET_ORIGIN,
-                "Referer": TARGET_ORIGIN + "/",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-            },
-            redirect: "follow"
-        }, 30000, 3);
-
-        const ct = r.headers.get("content-type") || "";
-
-        if (ct.includes("text/html") || ct.includes("javascript")) {
-            let text = await r.text();
-            text = text.split(TARGET_ORIGIN).join(`${proto}://${host}`);
-            res.setHeader("Content-Type", ct);
-            res.setHeader("Access-Control-Allow-Origin", "*");
-            return res.status(r.status).send(text);
-        }
-
-        for (const h of ["content-type", "content-length", "content-encoding", "cache-control", "etag", "last-modified"]) {
-            const v = r.headers.get(h);
-            if (v) res.setHeader(h, v);
-        }
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        res.status(r.status);
-        if (req.method === "HEAD" || !r.body) return res.end();
-        const stream = Readable.fromWeb(r.body);
-        stream.on("error", () => res.destroy());
-        stream.pipe(res);
-    } catch (e) {
-        res.status(500).set(STREAM_HEADERS).send(`Portal proxy error: ${e.message}`);
-    }
-}
-
-// ============================================================================
-// STATIC / MISC
-// ============================================================================
-
-app.get(["/private.json", "/sex/private.json"], (req, res) => {
-    res.set({
-        "Content-Type": "application/json; charset=UTF-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Access-Control-Allow-Origin": "*"
-    }).send(JSON.stringify(TOKEN_STORE));
-});
-
-app.get(["/tokens.json", "/sex/tokens.json"], (req, res) => {
-    jsonResponse(res, { status: 404, message: "Not found", data: [] }, 404);
-});
-
-app.all(["/_private/*", "/_lib/*", "/sex/_private/*", "/sex/_lib/*"], (req, res) => {
-    jsonResponse(res, { status: 404, message: "Not found", data: [] }, 404);
-});
-
-app.use((req, res) => {
-    jsonResponse(res, { status: 404, message: "Not found", data: [] }, 404);
-});
-
-// ============================================================================
-// START
-// ============================================================================
-
-app.listen(PORT, () => {
-    console.log(`✅ StudyBee API running on port ${PORT}`);
-    console.log(`   Concurrency: ${UPSTREAM_CONCURRENCY}`);
-    console.log(`   Cache TTL: ${CACHE_TTL_MS}ms`);
-    console.log(`   Retries: ${UPSTREAM_RETRIES}`);
-});
